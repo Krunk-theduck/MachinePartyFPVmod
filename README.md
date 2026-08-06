@@ -1,5 +1,7 @@
 # MachinePartyFPVmod
 A first person view mod for machine party
+
+[First person mod thumbnail](MACHINE PARTY FIRST PERSON VIEW THUMBNAIL.png)
   
 Features:  
 First person view in ALL gamemodes  
