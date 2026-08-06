@@ -383,7 +383,7 @@ func _hook_settings_ui(attempt: int = 0) -> void:
 	if checkbox_scene:
 		_lobby_fpv_toggle = checkbox_scene.instantiate() as Button
 		_lobby_fpv_toggle.name = "LobbyFpvToggle"
-		_lobby_fpv_toggle.button_text = "Lobby FPV (Experimental)"
+		_lobby_fpv_toggle.button_text = "Lobby FPV"
 		if checked_tex:
 			_lobby_fpv_toggle.set("checked_texture", checked_tex)
 		if unchecked_tex:
@@ -397,7 +397,7 @@ func _hook_settings_ui(attempt: int = 0) -> void:
 				func(): set_lobby_fpv_enabled(bool(_lobby_fpv_toggle.get("checked"))))
 		var lobby_hint := Label.new()
 		lobby_hint.name = "LobbyFpvHint"
-		lobby_hint.text = "hold Shift (keyboard) / LB (controller) to look -- experimental, may look off per-seat"
+		lobby_hint.text = "hold Shift (keyboard) / LB (controller) to look"
 		if font:
 			lobby_hint.add_theme_font_override("font", font)
 		lobby_hint.add_theme_font_size_override("font_size", 16)
