@@ -40,6 +40,11 @@ const DAMAGE_FLASH_DECAY := 2.2
 const DAMAGE_SHAKE_MAGNITUDE := 0.10  # world units, peak random jitter right after a hit
 const DAMAGE_SHAKE_DECAY := 7.0       # faster than DAMAGE_FLASH_DECAY -- a jolt, not a wobble
 
+# Smoke Break: a hands/head tremor that grows as you inhale (the game's `drag_progress` 0..1, choke at
+# >1). It stays calm early and ramps up hard near the top so you feel "stop now" before you choke.
+const SMOKE_SHAKE_START := 0.35       # drag_progress below this = no shake (a calm deadzone)
+const SMOKE_SHAKE_MAX := 0.085        # world units, peak jitter as drag_progress approaches 1.0
+
 const ONE_LIFE_OVERLAY_COLOR := Color(0.6, 0.0, 0.0)
 const ONE_LIFE_OVERLAY_MIN_ALPHA := 0.30
 const ONE_LIFE_OVERLAY_MAX_ALPHA := 0.55
@@ -70,7 +75,10 @@ const HAT_GIB_SCRIPT_PATH := "res://modules/prop_manager/scripts/hat_gib_prop.gd
 const HAT_SEARCH_WINDOW := 2.5
 
 const DEATH_BLACK_HOLD := 0.5
-const DEATH_BEHAVIOR_DEFAULT: Dictionary = {"mode": &"stay"}
+# Fallback for an unrecognized/unresolved class: ride the body ~3s then cut to third person. This is
+# a SAFETY NET so a client that fails to resolve the player's class can never get stuck riding the hat
+# forever ("stay" never auto-spectates). Every game that should truly stay is listed explicitly above.
+const DEATH_BEHAVIOR_DEFAULT: Dictionary = {"mode": &"corpse", "delay": 3.0}
 const DEATH_BEHAVIOR: Dictionary = {
 	&"BurnRecyclePlayer":         {"mode": &"corpse", "delay": 0.9, "black_end": true},  # Recycle: anim to the 0.9s stomp, then black -> spectate
 	&"ExplodingCollarRacePlayer": {"mode": &"hat",    "delay": 5.0},                     # Minefield: hat view 5s -> spectate
@@ -104,6 +112,13 @@ const SECRET_LEVEL_SCRIPT_PATH := "res://minigames/cutscene_test/scripts/cutscen
 const SECRET_LEVEL_FLOOR_RELATIVE_PATH := "Geometry/MeshInstance3D"
 const SECRET_LEVEL_FLOOR_TEXTURE_PATH := "res://minigames/duck_hunt/models/duck hunt environment2/duck hunt environment2_dh grass ground1.png"
 const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
+
+# Firearm Factory: the big inward-facing "fog_catcher" box (a direct child of the minigame) has no
+# material, so it renders solid white -- invisible to the framed 3rd-person cam but a blank wall in
+# FPV. Retexture it with the room's own "metal seawall" wall texture.
+const GUN_WALL_MESH_NAME := "fog_catcher"
+const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_metal seawall.png"
+const GUN_WALL_UV_SCALE := 20.0
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -178,7 +193,9 @@ var _cigarette_anim_t: float = 0.0   # time accumulator driving ember flicker + 
 var _smoke_timer_panel: Control      # digital "alarm clock" style round timer, top-center
 var _smoke_timer_label: Label
 var _smoke_timer_font: Font = null
-var _smoke_timer_source: Node = null # the minigame's own Label3D we mirror (kept in sync on every peer)
+var _smoke_timer_source: Node = null # the minigame's own timer label we mirror (kept in sync on every peer)
+var _round_timer_green: bool = false  # true = Forklift (green digits/bezel), false = Smoke Break (red)
+var _gun_wall_node: MeshInstance3D = null  # the gun game's blank "fog_catcher" box, once we've retextured it
 
 var _debris_grab_collision: CollisionShape3D = null
 var _debris_grab_original_shape: Shape3D = null
@@ -229,13 +246,11 @@ var _fpv_sub_section: Control = null  # indented container holding the sensitivi
 var _mouse_sens_slider: HSlider = null
 var _controller_sens_slider: HSlider = null
 var _lobby_fpv_toggle: Button = null
-var _stay_after_drop_toggle: Button = null
 var _hud_in_depth_toggle: Button = null
 
 var _fpv_settings_button: Button = null
 var _fpv_settings_popup: PopupPanel = null
 
-var stay_after_body_drop: bool = false
 var hud_in_depth: bool = true  # true = new detailed belt/cigarette art; false = old simplistic box/bar. Timer shows either way.
 
 var lobby_fpv_enabled: bool = false
@@ -460,30 +475,6 @@ func _hook_settings_ui(attempt: int = 0) -> void:
 		sub_vbox.add_child(lobby_hint)
 
 	if checkbox_scene:
-		_stay_after_drop_toggle = checkbox_scene.instantiate() as Button
-		_stay_after_drop_toggle.name = "StayAfterBodyDropToggle"
-		_stay_after_drop_toggle.button_text = "Stay After Body Drop"
-		if checked_tex:
-			_stay_after_drop_toggle.set("checked_texture", checked_tex)
-		if unchecked_tex:
-			_stay_after_drop_toggle.set("unchecked_texture", unchecked_tex)
-		if font:
-			_stay_after_drop_toggle.set("font_override", font)
-		_stay_after_drop_toggle.set("checked", stay_after_body_drop)
-		sub_vbox.add_child(_stay_after_drop_toggle)
-		if _stay_after_drop_toggle.has_signal("checkbox_toggled"):
-			_stay_after_drop_toggle.connect("checkbox_toggled",
-				func(): set_stay_after_body_drop(bool(_stay_after_drop_toggle.get("checked"))))
-		var stay_hint := Label.new()
-		stay_hint.name = "StayAfterBodyDropHint"
-		stay_hint.text = "stay on your body instead of cutting to spectate"
-		if font:
-			stay_hint.add_theme_font_override("font", font)
-		stay_hint.add_theme_font_size_override("font_size", 16)
-		stay_hint.modulate = Color(1.0, 1.0, 1.0, 0.55)
-		sub_vbox.add_child(stay_hint)
-
-	if checkbox_scene:
 		_manual_relock_toggle = checkbox_scene.instantiate() as Button
 		_manual_relock_toggle.name = "ManualRelockToggle"
 		_manual_relock_toggle.button_text = "Experimental: Hold Shift to Re-lock View"
@@ -586,13 +577,6 @@ func set_lobby_fpv_enabled(value: bool) -> void:
 	lobby_fpv_enabled = value
 	if not lobby_fpv_enabled:
 		_restore_lobby_camera()
-	_save_settings()
-
-
-func set_stay_after_body_drop(value: bool) -> void:
-	if value == stay_after_body_drop:
-		return
-	stay_after_body_drop = value
 	_save_settings()
 
 
@@ -1320,19 +1304,23 @@ func _draw_smoke_timer_panel() -> void:
 	var w: float = ci.size.x
 	var h: float = ci.size.y
 
+	var edge: Color = Color(0.13, 0.5, 0.16, 0.9) if _round_timer_green else Color(0.5, 0.12, 0.12, 0.9)
+	var screen_bg: Color = Color(0.02, 0.11, 0.03, 0.9) if _round_timer_green else Color(0.11, 0.02, 0.02, 0.9)
+	var scan: Color = Color(0.2, 1.0, 0.3, 0.06) if _round_timer_green else Color(1.0, 0.2, 0.2, 0.06)
+
 	var bezel: StyleBoxFlat = StyleBoxFlat.new()
 	bezel.bg_color = Color(0.06, 0.06, 0.07, 0.82)
 	bezel.set_corner_radius_all(9)
-	bezel.border_color = Color(0.5, 0.12, 0.12, 0.9)
+	bezel.border_color = edge
 	bezel.set_border_width_all(2)
 	bezel.draw(cvs, Rect2(0.0, 0.0, w, h))
 
 	var screen: StyleBoxFlat = StyleBoxFlat.new()
-	screen.bg_color = Color(0.11, 0.02, 0.02, 0.9)
+	screen.bg_color = screen_bg
 	screen.set_corner_radius_all(5)
 	screen.draw(cvs, Rect2(5.0, 5.0, w - 10.0, h - 10.0))
 
-	ci.draw_rect(Rect2(5.0, h * 0.5 - 1.0, w - 10.0, 2.0), Color(1.0, 0.2, 0.2, 0.06))  # faint scanline glow
+	ci.draw_rect(Rect2(5.0, h * 0.5 - 1.0, w - 10.0, 2.0), scan)  # faint scanline glow
 
 
 func _update_damage_flash(delta: float) -> void:
@@ -1389,6 +1377,38 @@ func _compute_damage_shake_offset() -> Vector3:
 	return (right * (-1.0 + randf() * 2.0) + Vector3.UP * (-1.0 + randf() * 2.0)) * _damage_shake_magnitude
 
 
+func _compute_smoke_shake_offset() -> Vector3:
+	# Smoke Break only: scale a jitter by how deep the current drag is (drag_progress 0..1). Grows
+	# quadratically so it's subtle mid-drag and unmistakable right before the choke at 1.0.
+	if _player_class_name != &"SmokeBreakPlayer" or _player == null or not is_instance_valid(_player):
+		return Vector3.ZERO
+	if not ("drag_progress" in _player):
+		return Vector3.ZERO
+	var dp: float = clampf(float(_player.get("drag_progress")), 0.0, 1.0)
+	if dp <= SMOKE_SHAKE_START:
+		return Vector3.ZERO
+	var t: float = (dp - SMOKE_SHAKE_START) / (1.0 - SMOKE_SHAKE_START)  # 0..1 across the danger band
+	var mag: float = t * t * SMOKE_SHAKE_MAX
+	var right: Vector3 = Basis(Vector3.UP, _yaw) * Vector3.RIGHT
+	return (right * (-1.0 + randf() * 2.0) + Vector3.UP * (-1.0 + randf() * 2.0)) * mag
+
+
+func _is_player_class(target: StringName) -> bool:
+	# True if the tracked player is `target`. Falls back to the SKELETON's owning player when the
+	# cached class name is stale (can happen on a client right at a round transition), so per-class
+	# behaviors (e.g. Recycle staying in FPV through ranking) hold up regardless.
+	if _player_class_name == target:
+		return true
+	if _skeleton != null and is_instance_valid(_skeleton):
+		var cur: Node = _skeleton
+		while cur != null:
+			var sc: Script = cur.get_script()
+			if sc and sc.get_global_name() == target:
+				return true
+			cur = cur.get_parent()
+	return false
+
+
 func _hide_class_specific_hud() -> void:
 	_one_life_overlay.visible = false
 	_collar_belt.visible = false
@@ -1422,21 +1442,31 @@ func _update_smoke_break_hud() -> void:
 	_cigarette_anim_t += get_process_delta_time()
 	_cigarette_hud.visible = true
 	_cigarette_hud.queue_redraw()
-	_update_smoke_break_timer()
 
 
-func _update_smoke_break_timer() -> void:
-	# Mirror the minigame's own countdown Label3D (kept in sync on every peer via its
-	# call_local tick RPC) so the HUD timer reads identically on host and clients.
-	if _smoke_timer_source == null or not is_instance_valid(_smoke_timer_source):
-		_smoke_timer_source = _find_smoke_timer_label()
-	var txt: String = ""
-	if _smoke_timer_source != null and is_instance_valid(_smoke_timer_source):
-		txt = String(_smoke_timer_source.get("text"))
-	if txt == "":
+func _update_round_timer() -> void:
+	# Top-center digital round timer, mirrored from the minigame's own `timer_label` (updated on every
+	# peer via a call_local RPC, so it reads identically on host and clients). Smoke Break's label is
+	# already "00:SS" and shows red; Forklift's is bare seconds "SS" that we compose to "00:SS" and
+	# show green. Only these two games have a round timer worth mirroring.
+	var green: bool = _player_class_name == &"ForkliftCertifiedVehicle"
+	if _player_class_name != &"SmokeBreakPlayer" and not green:
 		_smoke_timer_panel.visible = false
 		return
-	_smoke_timer_label.text = txt
+	_round_timer_green = green
+	if _smoke_timer_source == null or not is_instance_valid(_smoke_timer_source):
+		_smoke_timer_source = _find_smoke_timer_label()
+	var raw: String = ""
+	if _smoke_timer_source != null and is_instance_valid(_smoke_timer_source):
+		raw = String(_smoke_timer_source.get("text")).strip_edges()
+	if raw == "":
+		_smoke_timer_panel.visible = false
+		return
+	_smoke_timer_label.text = ("00:%02d" % int(raw)) if green else raw
+	_smoke_timer_label.add_theme_color_override("font_color",
+		Color(0.2, 1.0, 0.3, 1.0) if green else Color(1.0, 0.05, 0.05, 1.0))
+	_smoke_timer_label.add_theme_color_override("font_outline_color",
+		Color(0.0, 0.22, 0.0, 0.9) if green else Color(0.25, 0.0, 0.0, 0.9))
 	_smoke_timer_panel.visible = true
 	_smoke_timer_panel.queue_redraw()
 
@@ -1612,10 +1642,11 @@ func _process(delta: float) -> void:
 		return
 
 	if not active:
-		# Recycle: survivors are set inactive at round end while the round's loser is crushed. That is
-		# NOT death for them -- keep them in first person until their OWN is_dead flips. Isolated to
-		# Recycle; leaves every other minigame's death cam untouched.
-		if (_player_class_name == &"BurnRecyclePlayer" and _ever_active
+		# Recycle: at round end EVERY player (survivors and the soon-to-be-crushed loser) is set
+		# inactive while the game ranks scores, pans to the loser's seat, and picks who dies. None of
+		# that is death, so stay in first person through the whole ranking/pick window -- only the
+		# player's OWN is_dead flip (the actual crush) ends it. Isolated to Recycle.
+		if (_is_player_class(&"BurnRecyclePlayer") and _ever_active
 				and not ("is_dead" in _player and bool(_player.get("is_dead")))):
 			_update_mouse_capture()
 			_render_head_cam(delta, false)
@@ -1678,7 +1709,7 @@ func _render_head_cam(delta: float, active: bool) -> void:
 		_smoothed_head_pos = _smooth_head_pos_toward(_smoothed_head_pos, target_head_pos, delta)
 
 	_camera_enter_tree()  # must be parented before writing its global transform
-	_camera.global_transform = Transform3D(look_basis, _smoothed_head_pos + _compute_damage_shake_offset())
+	_camera.global_transform = Transform3D(look_basis, _smoothed_head_pos + _compute_damage_shake_offset() + _compute_smoke_shake_offset())
 
 	if active and not _freeze_body and _visuals and is_instance_valid(_visuals):
 		_visuals.global_rotation.y = _yaw
@@ -1692,8 +1723,64 @@ func _render_head_cam(delta: float, active: bool) -> void:
 		_update_damage_flash(delta)
 		_update_collar_indicator()
 		_update_smoke_break_hud()
+		_update_round_timer()
+		_update_gun_wall()
 
 	_set_fpv_camera_active(true)
+
+
+func _find_minigame_node() -> Node:
+	var cur: Node = _player
+	while cur != null and is_instance_valid(cur):
+		if _script_is_or_extends(cur.get_script(), &"Minigame"):
+			return cur
+		cur = cur.get_parent()
+	return null
+
+
+func _update_gun_wall() -> void:
+	# Firearm Factory only: paint the room's wall texture onto the untextured "fog_catcher" box so it
+	# isn't a blank white wall in first person. Done once (cached); the box is a child of the minigame.
+	if _gun_wall_node != null and is_instance_valid(_gun_wall_node):
+		return
+	if _player_class_name != &"ManufactureGunPlayer":
+		return
+	var mg: Node = _find_minigame_node()
+	if mg == null:
+		return
+	var wall := mg.get_node_or_null(GUN_WALL_MESH_NAME) as MeshInstance3D
+	if wall == null:
+		return
+	var mat := StandardMaterial3D.new()
+	var tex: Texture2D = load(GUN_WALL_TEXTURE_PATH) as Texture2D
+	if tex:
+		mat.albedo_texture = tex
+		mat.uv1_scale = Vector3(GUN_WALL_UV_SCALE, GUN_WALL_UV_SCALE, 1.0)
+	else:
+		mat.albedo_color = Color(0.30, 0.32, 0.34)  # neutral fallback if the texture can't load
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED  # the box is flip_faces -- render both sides
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS
+	mat.roughness = 0.8
+	wall.material_override = mat
+	_gun_wall_node = wall
+	print("[fpv_mod] gun game: textured the blank fog_catcher wall")
+
+
+func _class_from_skeleton_owner() -> StringName:
+	# Walk up from the tracked skeleton to the nearest ancestor whose script global name is a known
+	# death-behavior class. The skeleton reliably belongs to the real player even if _player latched
+	# onto a seat/workstation node that shares our player_presence, or if the cached class went stale.
+	if _skeleton == null or not is_instance_valid(_skeleton):
+		return &""
+	var cur: Node = _skeleton
+	while cur != null:
+		var sc: Script = cur.get_script()
+		if sc:
+			var gn: StringName = sc.get_global_name()
+			if DEATH_BEHAVIOR.has(gn):
+				return gn
+		cur = cur.get_parent()
+	return &""
 
 
 func _process_death_cam(delta: float) -> void:
@@ -1713,11 +1800,23 @@ func _process_death_cam(delta: float) -> void:
 		_damage_flash_rect.color = Color(DAMAGE_FLASH_COLOR.r, DAMAGE_FLASH_COLOR.g, DAMAGE_FLASH_COLOR.b, 0.0)
 		_hide_class_specific_hud()
 		_set_death_black(0.0)
-		var beh: Dictionary = DEATH_BEHAVIOR.get(_player_class_name, DEATH_BEHAVIOR_DEFAULT)
+		# Resolve the death behavior robustly. On a CLIENT the cached _player_class_name can be wrong
+		# or empty (the class/presence of a spawner-replicated node can settle a beat late, so the
+		# per-game key misses and we'd fall to the default). The SKELETON always belongs to the real
+		# player, so if the cached class isn't a recognized death class, re-derive it by walking up
+		# from the skeleton to the nearest ancestor whose script IS a known death class.
+		var cls: StringName = _player_class_name
+		if not DEATH_BEHAVIOR.has(cls):
+			var derived: StringName = _class_from_skeleton_owner()
+			if derived != &"":
+				cls = derived
+				_player_class_name = cls  # correct it so the rest of the death cam + HUD use the right class
+		var beh: Dictionary = DEATH_BEHAVIOR.get(cls, DEATH_BEHAVIOR_DEFAULT)
 		_death_mode = StringName(beh.get("mode", &"stay"))
 		_death_delay = float(beh.get("delay", 0.0))
 		_death_black_end = bool(beh.get("black_end", false))
-		print("[fpv_mod] death cam start: class='", _player_class_name, "' mode=", _death_mode, " delay=", _death_delay)
+		print("[fpv_mod] death cam start: class='", cls, "' (cached='", _player_class_name,
+			"' node='", (_player.name if _player and is_instance_valid(_player) else "null"), "') mode=", _death_mode, " delay=", _death_delay)
 
 	_dying_timer -= delta
 	_apply_controller_look(delta)  # right-stick look-around during the death cam too (self-gated)
@@ -1733,8 +1832,6 @@ func _process_death_cam(delta: float) -> void:
 	var elapsed: float = DEATH_CAM_SAFETY_TIME - _dying_timer
 
 	var mode: StringName = _death_mode
-	if stay_after_body_drop and mode == &"corpse":
-		mode = &"stay"
 
 	if mode == &"spectate":
 		_spectate_release("spectate")
@@ -1963,7 +2060,7 @@ func _input(event: InputEvent) -> void:
 		return
 	if not _player_is_active() and _ever_active and not _dying:
 		return
-	if _dying and not stay_after_body_drop:
+	if _dying:
 		return
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		var sens := MOUSE_SENSITIVITY * _mouse_sensitivity_mult
@@ -1993,7 +2090,7 @@ func _apply_controller_look(delta: float) -> void:
 		return
 	if not _player_is_active() and _ever_active and not _dying:
 		return
-	if _dying and not stay_after_body_drop:
+	if _dying:
 		return
 
 	var device: int = _look_joypad_device()
@@ -2244,6 +2341,7 @@ func _rescan_player() -> void:
 		_smoke_break_cigarette_node = null
 		_smoke_break_finish_locked = false
 		_smoke_timer_source = null
+		_gun_wall_node = null
 		if _player_class_name == &"SmokeBreakPlayer" and "anim_handler" in player_node:
 			var anim_h = player_node.get("anim_handler")
 			if anim_h and is_instance_valid(anim_h) and "cig_scale_parent" in anim_h:
@@ -2366,7 +2464,6 @@ func _save_settings() -> void:
 		f.store_string(JSON.stringify({
 			"enabled": enabled,
 			"lobby_fpv_enabled": lobby_fpv_enabled,
-			"stay_after_body_drop": stay_after_body_drop,
 			"hud_in_depth": hud_in_depth,
 			"experimental_manual_relock_enabled": experimental_manual_relock_enabled,
 			"mouse_sensitivity_mult": _mouse_sensitivity_mult,
@@ -2385,7 +2482,6 @@ func _load_settings() -> void:
 	if typeof(parsed) == TYPE_DICTIONARY:
 		enabled = bool(parsed.get("enabled", false))
 		lobby_fpv_enabled = bool(parsed.get("lobby_fpv_enabled", false))
-		stay_after_body_drop = bool(parsed.get("stay_after_body_drop", false))
 		hud_in_depth = bool(parsed.get("hud_in_depth", true))
 		experimental_manual_relock_enabled = bool(parsed.get("experimental_manual_relock_enabled", false))
 		var legacy: float = float(parsed.get("sensitivity_mult", 1.0))
