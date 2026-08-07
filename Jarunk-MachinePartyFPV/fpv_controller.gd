@@ -75,6 +75,7 @@ const HAT_GIB_SCRIPT_PATH := "res://modules/prop_manager/scripts/hat_gib_prop.gd
 const HAT_SEARCH_WINDOW := 2.5
 
 const DEATH_BLACK_HOLD := 0.5
+const DUCK_ESCAPE_BLACK_HOLD := 0.8  # Duck Hunt runner escapes: hold black this long (covering the game's own fade) before cutting to spectate, so no weird angle flashes
 # Fallback for an unrecognized/unresolved class: ride the body ~3s then cut to third person. This is
 # a SAFETY NET so a client that fails to resolve the player's class can never get stuck riding the hat
 # forever ("stay" never auto-spectates). Every game that should truly stay is listed explicitly above.
@@ -93,7 +94,7 @@ const DEATH_BEHAVIOR: Dictionary = {
 	&"JunkPlatformPlayer":        {"mode": &"corpse", "delay": 1.6},                     # Debris Platform: fall rides down / crush -> black -> spectate
 	&"SpineBreakerPlayer":        {"mode": &"corpse", "delay": 4.0},                     # Spine Breaker: ~1s kill anim + 3s floor -> spectate
 	&"SmokeBreakPlayer":          {"mode": &"stay"},                                     # Smoke Break: unchanged
-	&"ForkliftCertifiedVehicle":  {"mode": &"stay"},                                     # Forklift: unchanged
+	&"ForkliftCertifiedVehicle":  {"mode": &"corpse", "delay": 3.0},                     # Forklift: eliminated -> ride body 3s -> spectate
 }
 
 const CAMERA_TUNING_OVERRIDES: Dictionary = {
@@ -118,6 +119,7 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 # FPV. Retexture it with the room's own "metal seawall" wall texture.
 const GUN_WALL_MESH_NAME := "fog_catcher"
 const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_metal seawall.png"
+const GUN_WALL_TEXTURE_UID := "uid://bamnqdavhc3ny"  # same "metal seawall" texture, by resource UID (export-safe fallback)
 const GUN_WALL_UV_SCALE := 20.0
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
@@ -196,6 +198,7 @@ var _smoke_timer_font: Font = null
 var _smoke_timer_source: Node = null # the minigame's own timer label we mirror (kept in sync on every peer)
 var _round_timer_green: bool = false  # true = Forklift (green digits/bezel), false = Smoke Break (red)
 var _gun_wall_node: MeshInstance3D = null  # the gun game's blank "fog_catcher" box, once we've retextured it
+var _gun_wall_logged: bool = false  # one-shot diagnostic if we can't find the wall mesh
 
 var _debris_grab_collision: CollisionShape3D = null
 var _debris_grab_original_shape: Shape3D = null
@@ -1598,18 +1601,27 @@ func _process(delta: float) -> void:
 		and _skeleton != null and is_instance_valid(_skeleton) and _head_bone_idx >= 0)
 	var active := have_rig and _player_is_active()
 
-	# Forklift: the ONLY time the forklift leaves first person is the crane "take the package away"
-	# tie scene -- the between-round crate removal (crate_manager.remove_indicies_after_move is
-	# non-empty on every peer). Turn FPV fully off for it, then resume. A normal kill/elimination
-	# is NOT this scene, so it falls through and stays in FPV (death-cam "stay") like every other game.
+	# Forklift has three distinct inactive states, handled in priority order:
 	if have_rig and _player_class_name == &"ForkliftCertifiedVehicle":
+		# (1) ELIMINATED this round (blood decals shown) -> ride the body ~3s then cut to 3rd person
+		# and stay there, like every other death. Checked first so a death isn't swallowed by, or
+		# restarted after, the crane scene.
+		if not active and _ever_active and _forklift_eliminated():
+			_process_death_cam(delta)  # ForkliftCertifiedVehicle is corpse/3s
+			return
+		# (2) The crane "take the package away" tie scene (survivors) -> FPV fully off for its duration.
 		if _is_forklift_crate_pickup_active():
 			_forklift_third_person_handoff()
 			return
-		elif _forklift_third_person_active:
+		if _forklift_third_person_active:
 			_forklift_third_person_active = false
 			_snap_head_smoothing = true
-			_end_death_cam()  # package scene over -- back into the normal FPV / death-cam flow
+			_end_death_cam()  # package scene over
+		# (3) A survivor set inactive between rounds (scores/crane) -> stay in FPV until reactivated.
+		if not active and _ever_active:
+			_update_mouse_capture()
+			_render_head_cam(delta, false)
+			return
 
 	if _dying:
 		if active:
@@ -1729,30 +1741,40 @@ func _render_head_cam(delta: float, active: bool) -> void:
 	_set_fpv_camera_active(true)
 
 
-func _find_minigame_node() -> Node:
-	var cur: Node = _player
-	while cur != null and is_instance_valid(cur):
-		if _script_is_or_extends(cur.get_script(), &"Minigame"):
-			return cur
-		cur = cur.get_parent()
+func _find_mesh_named(n: Node, mesh_name: String, budget: Array) -> MeshInstance3D:
+	if budget[0] <= 0:
+		return null
+	budget[0] -= 1
+	if n is MeshInstance3D and String(n.name) == mesh_name:
+		return n as MeshInstance3D
+	for ch in n.get_children():
+		var found := _find_mesh_named(ch, mesh_name, budget)
+		if found:
+			return found
 	return null
 
 
 func _update_gun_wall() -> void:
-	# Firearm Factory only: paint the room's wall texture onto the untextured "fog_catcher" box so it
-	# isn't a blank white wall in first person. Done once (cached); the box is a child of the minigame.
+	# Firearm Factory only: paint the room's wall texture onto the untextured "fog_catcher" box (a
+	# ~106u inward box that renders solid white in FPV). Searched from the tree root by node name so
+	# it works regardless of the minigame's exact node path; applied once and cached.
 	if _gun_wall_node != null and is_instance_valid(_gun_wall_node):
 		return
 	if _player_class_name != &"ManufactureGunPlayer":
 		return
-	var mg: Node = _find_minigame_node()
-	if mg == null:
+	var tree := get_tree()
+	if tree == null:
 		return
-	var wall := mg.get_node_or_null(GUN_WALL_MESH_NAME) as MeshInstance3D
+	var wall := _find_mesh_named(tree.root, GUN_WALL_MESH_NAME, [SCAN_BUDGET])
 	if wall == null:
+		if not _gun_wall_logged:
+			_gun_wall_logged = true
+			print("[fpv_mod] gun wall: no MeshInstance3D named '", GUN_WALL_MESH_NAME, "' found yet")
 		return
 	var mat := StandardMaterial3D.new()
 	var tex: Texture2D = load(GUN_WALL_TEXTURE_PATH) as Texture2D
+	if tex == null:
+		tex = load(GUN_WALL_TEXTURE_UID) as Texture2D  # fall back to the resource UID if the path fails
 	if tex:
 		mat.albedo_texture = tex
 		mat.uv1_scale = Vector3(GUN_WALL_UV_SCALE, GUN_WALL_UV_SCALE, 1.0)
@@ -1763,7 +1785,7 @@ func _update_gun_wall() -> void:
 	mat.roughness = 0.8
 	wall.material_override = mat
 	_gun_wall_node = wall
-	print("[fpv_mod] gun game: textured the blank fog_catcher wall")
+	print("[fpv_mod] gun wall: textured '", wall.get_path(), "' (texture loaded=", tex != null, ")")
 
 
 func _class_from_skeleton_owner() -> StringName:
@@ -1863,9 +1885,14 @@ func _process_death_cam(delta: float) -> void:
 				_set_death_black(0.0)
 				_death_apply_camera(_death_ride_corpse())
 			elif _player_class_name == &"DuckHuntDuckPlayer":
-				# Runner reached the exit and left (the duck node is hidden, not killed) -- there's no
-				# corpse to watch, so turn FPV off straight to the game's spectator camera, like Minefield.
-				_spectate_release("duck reached exit -> spectate")
+				# Runner reached the exit and left (the duck node is hidden, not killed). The game plays
+				# its own fade-to-black here -- match it with our black for a beat so no weird angle
+				# flashes, THEN turn FPV off to the spectator camera.
+				if elapsed < DUCK_ESCAPE_BLACK_HOLD:
+					_set_death_black(1.0)
+					_death_apply_camera(_dying_anchor)
+				else:
+					_spectate_release("duck reached exit -> spectate")
 			else:
 				_set_death_black(1.0)  # instant crush, nothing to watch -> black
 				_death_apply_camera(_dying_anchor)
@@ -1973,6 +2000,18 @@ func _is_forklift_crate_pickup_active() -> bool:
 		return false
 	var arr = _forklift_crate_manager.get("remove_indicies_after_move")
 	return typeof(arr) == TYPE_ARRAY and not (arr as Array).is_empty()
+
+
+func _forklift_eliminated() -> bool:
+	# A forklift player that was eliminated this round shows blood decals (set true only in
+	# set_eliminated_rpc, call_local -> all peers). Distinguishes a real death from a survivor who is
+	# merely inactive between rounds.
+	if _player == null or not is_instance_valid(_player):
+		return false
+	if not ("blood_decals_parent" in _player):
+		return false
+	var bd = _player.get("blood_decals_parent")
+	return bd != null and is_instance_valid(bd) and bool(bd.get("visible"))
 
 
 func _forklift_third_person_handoff() -> void:
@@ -2342,6 +2381,7 @@ func _rescan_player() -> void:
 		_smoke_break_finish_locked = false
 		_smoke_timer_source = null
 		_gun_wall_node = null
+		_gun_wall_logged = false
 		if _player_class_name == &"SmokeBreakPlayer" and "anim_handler" in player_node:
 			var anim_h = player_node.get("anim_handler")
 			if anim_h and is_instance_valid(anim_h) and "cig_scale_parent" in anim_h:
