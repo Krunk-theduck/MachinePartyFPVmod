@@ -1,5 +1,7 @@
 <h1 align="center">MachinePartyFPV</h1>
 
+<p align="center"><b>Made by J_axon and Krunk</b></p>
+
 <p align="center">
   <img src="assets/banner.png" alt="MachinePartyFPV - a first person view mod for Machine Party" width="100%">
 </p>
