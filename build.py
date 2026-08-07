@@ -29,12 +29,13 @@ def main() -> None:
         for root, _dirs, files in os.walk(SRC):
             for fn in files:
                 full = os.path.join(root, fn)
-                # keep the mod folder inside the zip -> extract gives mods/Jarunk-MachinePartyFPV/
-                rel = os.path.join(MOD_DIR, os.path.relpath(full, SRC)).replace("\\", "/")
+                # files at the ZIP ROOT (one layer): Windows "Extract All" wraps them in a single
+                # folder named after the zip, giving mods/Jarunk-MachinePartyFPV/ with no double nesting.
+                rel = os.path.relpath(full, SRC).replace("\\", "/")
                 z.write(full, rel)
                 count += 1
     print("Built " + OUT + " (" + str(count) + " files)")
-    print("Extract it into your game's mods/ folder to get mods/" + MOD_DIR + "/.")
+    print("Windows 'Extract All' makes a single " + MOD_DIR + " folder; drop it in mods/.")
 
 
 if __name__ == "__main__":
