@@ -118,9 +118,9 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 # material, so it renders solid white -- invisible to the framed 3rd-person cam but a blank wall in
 # FPV. Retexture it with the room's own "metal seawall" wall texture.
 const GUN_WALL_MESH_NAME := "fog_catcher"
-const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_metal seawall.png"
-const GUN_WALL_TEXTURE_UID := "uid://bamnqdavhc3ny"  # same "metal seawall" texture, by resource UID (export-safe fallback)
-const GUN_WALL_UV_SCALE := 20.0
+const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_brick wall1.png"
+const GUN_WALL_TEXTURE_UID := "uid://bbopvwko13gmf"  # the room's "brick wall1" texture, by resource UID (export-safe fallback)
+const GUN_WALL_UV_SCALE := 26.0
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -1775,14 +1775,18 @@ func _update_gun_wall() -> void:
 	var tex: Texture2D = load(GUN_WALL_TEXTURE_PATH) as Texture2D
 	if tex == null:
 		tex = load(GUN_WALL_TEXTURE_UID) as Texture2D  # fall back to the resource UID if the path fails
+	# UNSHADED: the fog_catcher shell's back face gets almost no light, so a lit material renders
+	# near-black (that's why it looked "blank"). Self-lit shows the wall texture at a readable,
+	# slightly toned-down brightness regardless of the room lighting.
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	if tex:
 		mat.albedo_texture = tex
+		mat.albedo_color = Color(0.78, 0.76, 0.72)  # tone the unshaded texture down so it doesn't blow out
 		mat.uv1_scale = Vector3(GUN_WALL_UV_SCALE, GUN_WALL_UV_SCALE, 1.0)
 	else:
-		mat.albedo_color = Color(0.30, 0.32, 0.34)  # neutral fallback if the texture can't load
+		mat.albedo_color = Color(0.34, 0.30, 0.27)  # neutral fallback if the texture can't load
 	mat.cull_mode = BaseMaterial3D.CULL_DISABLED  # the box is flip_faces -- render both sides
 	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS
-	mat.roughness = 0.8
 	wall.material_override = mat
 	_gun_wall_node = wall
 	print("[fpv_mod] gun wall: textured '", wall.get_path(), "' (texture loaded=", tex != null, ")")
