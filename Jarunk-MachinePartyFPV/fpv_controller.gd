@@ -30,9 +30,9 @@ const CROSSHAIR_ALPHA := 0.55
 
 const DAMAGE_FLASH_HEALTH_PROPERTY: Dictionary = {
 	&"ExplodingCollarRacePlayer": "lives",
-	&"KnifeAtTheOfficePlayer": "health",
 	&"DuckHuntDuckPlayer": "health",
 }
+const INFECTION_FLASH_CLASS: StringName = &"KnifeAtTheOfficePlayer"  # Inside Job: no health -- flash only while is_infected && !active (the transformation window)
 const DAMAGE_FLASH_COLOR := Color(0.55, 0.0, 0.0)
 const DAMAGE_FLASH_PEAK_ALPHA := 0.6  # bumped up so the "bloody" hit is unmissable
 const DAMAGE_FLASH_DECAY := 2.2
@@ -99,6 +99,15 @@ const CAMERA_TUNING_OVERRIDES: Dictionary = {
 const SMOKE_BREAK_CIGARETTE_EYE_UP := 0.24
 const SMOKE_BREAK_CIGARETTE_EYE_BACK := 0.14
 
+const SECRET_LEVEL_FLOOR_SCAN_IV := 1.0
+const SECRET_LEVEL_SCRIPT_PATH := "res://minigames/cutscene_test/scripts/cutscene_test.gd"
+const SECRET_LEVEL_FLOOR_RELATIVE_PATH := "Geometry/MeshInstance3D"
+const SECRET_LEVEL_FLOOR_TEXTURE_PATH := "res://minigames/duck_hunt/models/duck hunt environment2/duck hunt environment2_dh grass ground1.png"
+const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
+
+const MANUAL_RELOCK_KEY := KEY_SHIFT
+const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
+
 const DEATH_CAM_SAFETY_TIME := 60.0
 
 const HEAD_BOB_SMOOTHING := 14.0
@@ -155,12 +164,21 @@ var _one_life_overlay: ColorRect
 var _one_life_overlay_material: ShaderMaterial
 var _one_life_pulse_time: float = 0.0
 
-var _collar_indicator: ColorRect
-var _collar_indicator_label: Label
+var _collar_belt: Control            # custom-drawn "exploding collar" belt indicator (Minefield)
+var _collar_belt_color: Color = Color(0.1, 1.0, 0.2, 1.0)  # live collar-light color (green -> red)
+var _collar_belt_pulse: float = 0.0  # sine phase for the danger pulse when the light goes red
 
 var _smoke_break_cigarette_node: Node3D = null
-var _cigarette_bar_bg: ColorRect
-var _cigarette_bar_fill: ColorRect
+var _smoke_break_finish_locked: bool = false
+var _smoke_break_locked_head_pos: Vector3 = Vector3.ZERO
+var _cigarette_hud: Control          # custom-drawn burning cigarette (replaces the flat bar)
+var _cigarette_frac: float = 1.0     # 0..1 amount of cigarette left
+var _cigarette_anim_t: float = 0.0   # time accumulator driving ember flicker + smoke wisp
+
+var _smoke_timer_panel: Control      # digital "alarm clock" style round timer, top-center
+var _smoke_timer_label: Label
+var _smoke_timer_font: Font = null
+var _smoke_timer_source: Node = null # the minigame's own Label3D we mirror (kept in sync on every peer)
 
 var _debris_grab_collision: CollisionShape3D = null
 var _debris_grab_original_shape: Shape3D = null
@@ -212,11 +230,13 @@ var _mouse_sens_slider: HSlider = null
 var _controller_sens_slider: HSlider = null
 var _lobby_fpv_toggle: Button = null
 var _stay_after_drop_toggle: Button = null
+var _hud_in_depth_toggle: Button = null
 
 var _fpv_settings_button: Button = null
 var _fpv_settings_popup: PopupPanel = null
 
 var stay_after_body_drop: bool = false
+var hud_in_depth: bool = true  # true = new detailed belt/cigarette art; false = old simplistic box/bar. Timer shows either way.
 
 var lobby_fpv_enabled: bool = false
 var _lobby_cam: Camera3D = null  # the lobby SubViewport's Camera3D while we're driving it
@@ -251,6 +271,17 @@ var _movement_base_yaw: float = 0.0
 var _player_class_name: StringName = &""
 
 var _forklift_crate_manager: Node = null
+var _forklift_third_person_active: bool = false  # handed the forklift's between-round cutscene back to the game's 3rd-person camera
+
+var _secret_level_floor_node: MeshInstance3D = null
+var _secret_level_floor_accum: float = 0.0
+
+var experimental_manual_relock_enabled: bool = false
+var _manual_relock_toggle: Button = null
+var _relock_key_was_down: bool = false
+
+var _yaw_reseed_pending: bool = false
+var _yaw_reseed_timer: float = 0.0
 
 
 func _ready() -> void:
@@ -381,6 +412,30 @@ func _hook_settings_ui(attempt: int = 0) -> void:
 	sub_section.add_child(sub_vbox)
 
 	if checkbox_scene:
+		_hud_in_depth_toggle = checkbox_scene.instantiate() as Button
+		_hud_in_depth_toggle.name = "HudInDepthToggle"
+		_hud_in_depth_toggle.button_text = "In-Depth HUD Art"
+		if checked_tex:
+			_hud_in_depth_toggle.set("checked_texture", checked_tex)
+		if unchecked_tex:
+			_hud_in_depth_toggle.set("unchecked_texture", unchecked_tex)
+		if font:
+			_hud_in_depth_toggle.set("font_override", font)
+		_hud_in_depth_toggle.set("checked", hud_in_depth)
+		sub_vbox.add_child(_hud_in_depth_toggle)
+		if _hud_in_depth_toggle.has_signal("checkbox_toggled"):
+			_hud_in_depth_toggle.connect("checkbox_toggled",
+				func(): set_hud_in_depth(bool(_hud_in_depth_toggle.get("checked"))))
+		var hud_hint := Label.new()
+		hud_hint.name = "HudInDepthHint"
+		hud_hint.text = "on = detailed collar belt & burning cigarette; off = simplistic box & bar (timer stays either way)"
+		if font:
+			hud_hint.add_theme_font_override("font", font)
+		hud_hint.add_theme_font_size_override("font_size", 16)
+		hud_hint.modulate = Color(1.0, 1.0, 1.0, 0.55)
+		sub_vbox.add_child(hud_hint)
+
+	if checkbox_scene:
 		_lobby_fpv_toggle = checkbox_scene.instantiate() as Button
 		_lobby_fpv_toggle.name = "LobbyFpvToggle"
 		_lobby_fpv_toggle.button_text = "Lobby FPV"
@@ -427,6 +482,30 @@ func _hook_settings_ui(attempt: int = 0) -> void:
 		stay_hint.add_theme_font_size_override("font_size", 16)
 		stay_hint.modulate = Color(1.0, 1.0, 1.0, 0.55)
 		sub_vbox.add_child(stay_hint)
+
+	if checkbox_scene:
+		_manual_relock_toggle = checkbox_scene.instantiate() as Button
+		_manual_relock_toggle.name = "ManualRelockToggle"
+		_manual_relock_toggle.button_text = "Experimental: Hold Shift to Re-lock View"
+		if checked_tex:
+			_manual_relock_toggle.set("checked_texture", checked_tex)
+		if unchecked_tex:
+			_manual_relock_toggle.set("unchecked_texture", unchecked_tex)
+		if font:
+			_manual_relock_toggle.set("font_override", font)
+		_manual_relock_toggle.set("checked", experimental_manual_relock_enabled)
+		sub_vbox.add_child(_manual_relock_toggle)
+		if _manual_relock_toggle.has_signal("checkbox_toggled"):
+			_manual_relock_toggle.connect("checkbox_toggled",
+				func(): set_experimental_manual_relock_enabled(bool(_manual_relock_toggle.get("checked"))))
+		var relock_hint := Label.new()
+		relock_hint.name = "ManualRelockHint"
+		relock_hint.text = "press Shift (keyboard) / LB (controller) to re-center your view lock in non-movement games"
+		if font:
+			relock_hint.add_theme_font_override("font", font)
+		relock_hint.add_theme_font_size_override("font_size", 16)
+		relock_hint.modulate = Color(1.0, 1.0, 1.0, 0.55)
+		sub_vbox.add_child(relock_hint)
 
 	_mouse_sens_slider = _add_sensitivity_slider(
 		sub_vbox, font, "Mouse Sensitivity", "MouseSensitivitySlider",
@@ -514,6 +593,24 @@ func set_stay_after_body_drop(value: bool) -> void:
 	if value == stay_after_body_drop:
 		return
 	stay_after_body_drop = value
+	_save_settings()
+
+
+func set_hud_in_depth(value: bool) -> void:
+	if value == hud_in_depth:
+		return
+	hud_in_depth = value
+	if _collar_belt and is_instance_valid(_collar_belt):
+		_collar_belt.queue_redraw()
+	if _cigarette_hud and is_instance_valid(_cigarette_hud):
+		_cigarette_hud.queue_redraw()
+	_save_settings()
+
+
+func set_experimental_manual_relock_enabled(value: bool) -> void:
+	if value == experimental_manual_relock_enabled:
+		return
+	experimental_manual_relock_enabled = value
 	_save_settings()
 
 
@@ -816,6 +913,49 @@ func _find_node_named(root: Node, target: String, budget: Array) -> Node:
 
 
 
+func _update_secret_level_floor(delta: float) -> void:
+	if _secret_level_floor_node != null and is_instance_valid(_secret_level_floor_node):
+		return
+	_secret_level_floor_accum += delta
+	if _secret_level_floor_accum < SECRET_LEVEL_FLOOR_SCAN_IV:
+		return
+	_secret_level_floor_accum = 0.0
+	var tree := get_tree()
+	if tree == null:
+		return
+	var level_root := _find_node_with_script(tree.root, SECRET_LEVEL_SCRIPT_PATH, [SCAN_BUDGET])
+	if level_root == null:
+		return
+	var floor_mesh := level_root.get_node_or_null(SECRET_LEVEL_FLOOR_RELATIVE_PATH) as MeshInstance3D
+	if floor_mesh == null:
+		return
+	floor_mesh.visible = true
+	var mat := StandardMaterial3D.new()
+	var tex: Texture2D = load(SECRET_LEVEL_FLOOR_TEXTURE_PATH) as Texture2D
+	if tex:
+		mat.albedo_texture = tex
+		mat.uv1_scale = Vector3(SECRET_LEVEL_FLOOR_UV_SCALE, SECRET_LEVEL_FLOOR_UV_SCALE, 1.0)
+	else:
+		mat.albedo_color = Color(0.24, 0.21, 0.15)
+	floor_mesh.material_override = mat
+	_secret_level_floor_node = floor_mesh
+	print("[fpv_mod] secret level: enabled + textured floor at ", floor_mesh.get_path())
+
+
+func _find_node_with_script(n: Node, script_path: String, budget: Array) -> Node:
+	if budget[0] <= 0:
+		return null
+	budget[0] -= 1
+	var sc: Script = n.get_script()
+	if sc and sc.resource_path == script_path:
+		return n
+	for ch in n.get_children():
+		var found := _find_node_with_script(ch, script_path, budget)
+		if found:
+			return found
+	return null
+
+
 func set_enabled(value: bool) -> void:
 	if value == enabled:
 		return
@@ -859,7 +999,10 @@ func _deactivate() -> void:
 		_damage_flash_rect.color = Color(DAMAGE_FLASH_COLOR.r, DAMAGE_FLASH_COLOR.g, DAMAGE_FLASH_COLOR.b, 0.0)
 	_hide_class_specific_hud()
 	_smoke_break_cigarette_node = null
+	_smoke_break_finish_locked = false
 	_forklift_crate_manager = null
+	_forklift_third_person_active = false
+	_yaw_reseed_pending = false
 
 
 func _restore_head() -> void:
@@ -945,54 +1088,63 @@ func _create_crosshair() -> void:
 	_one_life_overlay.visible = false
 	_crosshair_layer.add_child(_one_life_overlay)
 
-	_collar_indicator_label = Label.new()
-	_collar_indicator_label.name = "FirstPersonViewCollarLabel"
-	_collar_indicator_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_collar_indicator_label.text = "COLLAR"
-	_collar_indicator_label.add_theme_font_size_override("font_size", 14)
-	_collar_indicator_label.modulate = Color(1.0, 1.0, 1.0, 0.7)
-	_collar_indicator_label.position = Vector2(20, 16)
-	_collar_indicator_label.visible = false
-	_crosshair_layer.add_child(_collar_indicator_label)
+	# --- Minefield "exploding collar" belt indicator (top-left, custom-drawn) ---
+	_collar_belt = Control.new()
+	_collar_belt.name = "FirstPersonViewCollarBelt"
+	_collar_belt.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_collar_belt.position = Vector2(18, 14)
+	_collar_belt.size = Vector2(214, 62)
+	_collar_belt.visible = false
+	_collar_belt.draw.connect(_draw_collar_belt)
+	_crosshair_layer.add_child(_collar_belt)
 
-	_collar_indicator = ColorRect.new()
-	_collar_indicator.name = "FirstPersonViewCollarIndicator"
-	_collar_indicator.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_collar_indicator.position = Vector2(20, 36)
-	_collar_indicator.size = Vector2(28, 28)
-	_collar_indicator.color = Color(0, 1, 0, 1)
-	_collar_indicator.visible = false
-	_crosshair_layer.add_child(_collar_indicator)
+	# --- Smoke Break burning-cigarette meter (bottom-center, custom-drawn) ---
+	_cigarette_hud = Control.new()
+	_cigarette_hud.name = "FirstPersonViewCigaretteHud"
+	_cigarette_hud.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_cigarette_hud.anchor_left = 0.5
+	_cigarette_hud.anchor_right = 0.5
+	_cigarette_hud.anchor_top = 1.0
+	_cigarette_hud.anchor_bottom = 1.0
+	_cigarette_hud.offset_left = -130
+	_cigarette_hud.offset_right = 130
+	_cigarette_hud.offset_top = -70
+	_cigarette_hud.offset_bottom = -18
+	_cigarette_hud.visible = false
+	_cigarette_hud.draw.connect(_draw_cigarette_hud)
+	_crosshair_layer.add_child(_cigarette_hud)
 
-	_cigarette_bar_bg = ColorRect.new()
-	_cigarette_bar_bg.name = "FirstPersonViewCigaretteBarBg"
-	_cigarette_bar_bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_cigarette_bar_bg.color = Color(0.0, 0.0, 0.0, 0.5)
-	_cigarette_bar_bg.anchor_left = 0.5
-	_cigarette_bar_bg.anchor_right = 0.5
-	_cigarette_bar_bg.anchor_top = 1.0
-	_cigarette_bar_bg.anchor_bottom = 1.0
-	_cigarette_bar_bg.offset_left = -80
-	_cigarette_bar_bg.offset_right = 80
-	_cigarette_bar_bg.offset_top = -34
-	_cigarette_bar_bg.offset_bottom = -24
-	_cigarette_bar_bg.visible = false
-	_crosshair_layer.add_child(_cigarette_bar_bg)
+	# --- Smoke Break digital round timer (top-center, matches the in-world alarm-clock screen) ---
+	_smoke_timer_font = load("res://fonts/alarm clock.ttf") as Font
+	_smoke_timer_panel = Control.new()
+	_smoke_timer_panel.name = "FirstPersonViewSmokeTimerPanel"
+	_smoke_timer_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_smoke_timer_panel.anchor_left = 0.5
+	_smoke_timer_panel.anchor_right = 0.5
+	_smoke_timer_panel.anchor_top = 0.0
+	_smoke_timer_panel.anchor_bottom = 0.0
+	_smoke_timer_panel.offset_left = -74
+	_smoke_timer_panel.offset_right = 74
+	_smoke_timer_panel.offset_top = 14
+	_smoke_timer_panel.offset_bottom = 82
+	_smoke_timer_panel.visible = false
+	_smoke_timer_panel.draw.connect(_draw_smoke_timer_panel)
+	_crosshair_layer.add_child(_smoke_timer_panel)
 
-	_cigarette_bar_fill = ColorRect.new()
-	_cigarette_bar_fill.name = "FirstPersonViewCigaretteBarFill"
-	_cigarette_bar_fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_cigarette_bar_fill.color = Color(0.85, 0.7, 0.55, 0.9)  # pale cigarette-paper tan
-	_cigarette_bar_fill.anchor_left = 0.5
-	_cigarette_bar_fill.anchor_right = 0.5
-	_cigarette_bar_fill.anchor_top = 1.0
-	_cigarette_bar_fill.anchor_bottom = 1.0
-	_cigarette_bar_fill.offset_left = -78
-	_cigarette_bar_fill.offset_right = 78  # rescaled from the left edge each frame -- see _update_smoke_break_hud
-	_cigarette_bar_fill.offset_top = -32
-	_cigarette_bar_fill.offset_bottom = -26
-	_cigarette_bar_fill.visible = false
-	_crosshair_layer.add_child(_cigarette_bar_fill)
+	_smoke_timer_label = Label.new()
+	_smoke_timer_label.name = "FirstPersonViewSmokeTimerLabel"
+	_smoke_timer_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_smoke_timer_label.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_smoke_timer_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_smoke_timer_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_smoke_timer_label.text = "00:00"
+	if _smoke_timer_font:
+		_smoke_timer_label.add_theme_font_override("font", _smoke_timer_font)
+	_smoke_timer_label.add_theme_font_size_override("font_size", 40)
+	_smoke_timer_label.add_theme_color_override("font_color", Color(1.0, 0.05, 0.05, 1.0))
+	_smoke_timer_label.add_theme_color_override("font_outline_color", Color(0.25, 0.0, 0.0, 0.9))
+	_smoke_timer_label.add_theme_constant_override("outline_size", 5)
+	_smoke_timer_panel.add_child(_smoke_timer_label)
 
 	_death_black_rect = ColorRect.new()
 	_death_black_rect.name = "FirstPersonViewDeathBlack"
@@ -1006,8 +1158,187 @@ func _draw_crosshair() -> void:
 	_crosshair.draw_circle(_crosshair.size * 0.5, CROSSHAIR_RADIUS, Color(1.0, 1.0, 1.0, CROSSHAIR_ALPHA))
 
 
+func _draw_collar_belt() -> void:
+	# A leather belt strap with a metal buckle housing the collar's warning light.
+	var ci: Control = _collar_belt
+	var cvs: RID = ci.get_canvas_item()
+	var w: float = ci.size.x
+	var h: float = ci.size.y
+
+	if not hud_in_depth:
+		_draw_collar_simple(ci)
+		return
+
+	# caption
+	var font: Font = ci.get_theme_default_font()
+	if font:
+		ci.draw_string(font, Vector2(3.0, 13.0), "COLLAR", HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color(1.0, 1.0, 1.0, 0.7))
+
+	var strap_top: float = 22.0
+	var strap_h: float = 26.0
+
+	# leather strap
+	var leather: StyleBoxFlat = StyleBoxFlat.new()
+	leather.bg_color = Color(0.17, 0.10, 0.055, 0.96)
+	leather.set_corner_radius_all(6)
+	leather.border_color = Color(0.36, 0.23, 0.12, 1.0)
+	leather.set_border_width_all(2)
+	leather.draw(cvs, Rect2(0.0, strap_top, w, strap_h))
+
+	# top sheen
+	ci.draw_rect(Rect2(5.0, strap_top + 3.0, w - 10.0, 4.0), Color(0.42, 0.27, 0.15, 0.45))
+
+	# double-row stitching
+	var stitch_col: Color = Color(0.80, 0.64, 0.38, 0.85)
+	var x: float = 7.0
+	while x < w - 7.0:
+		ci.draw_rect(Rect2(x, strap_top + 4.0, 6.0, 1.6), stitch_col)
+		ci.draw_rect(Rect2(x, strap_top + strap_h - 6.0, 6.0, 1.6), stitch_col)
+		x += 11.0
+
+	# belt holes on the left
+	var hole_y: float = strap_top + strap_h * 0.5
+	for i in range(3):
+		var hx: float = 18.0 + float(i) * 14.0
+		ci.draw_circle(Vector2(hx, hole_y), 2.7, Color(0.04, 0.02, 0.01, 1.0))
+		ci.draw_arc(Vector2(hx, hole_y), 2.7, 0.0, TAU, 12, Color(0.45, 0.30, 0.16, 0.7), 1.0, true)
+
+	# buckle (metal frame) toward the right-center
+	var buckle_w: float = 42.0
+	var buckle_h: float = strap_h + 10.0
+	var bx: float = w * 0.63 - buckle_w * 0.5
+	var by: float = strap_top + (strap_h - buckle_h) * 0.5
+	var buckle_rect: Rect2 = Rect2(bx, by, buckle_w, buckle_h)
+	var metal: StyleBoxFlat = StyleBoxFlat.new()
+	metal.bg_color = Color(0.60, 0.63, 0.70, 1.0)
+	metal.set_corner_radius_all(5)
+	metal.border_color = Color(0.85, 0.88, 0.94, 1.0)
+	metal.set_border_width_all(2)
+	metal.draw(cvs, buckle_rect)
+	var recess: StyleBoxFlat = StyleBoxFlat.new()
+	recess.bg_color = Color(0.11, 0.12, 0.15, 1.0)
+	recess.set_corner_radius_all(4)
+	recess.draw(cvs, buckle_rect.grow(-5.0))
+
+	# warning light = live collar color, with a danger pulse when it reddens
+	var base: Color = _collar_belt_color
+	var danger: float = clampf(base.r - base.g, 0.0, 1.0)
+	var pulse: float = 1.0
+	if danger > 0.25:
+		pulse = 0.6 + 0.4 * (sin(_collar_belt_pulse) * 0.5 + 0.5)
+	var led: Vector2 = buckle_rect.get_center()
+	ci.draw_circle(led, 12.0, Color(base.r, base.g, base.b, 0.20 * pulse))
+	ci.draw_circle(led, 8.5, Color(base.r, base.g, base.b, 0.40 * pulse))
+	ci.draw_circle(led, 5.5, Color(base.r, base.g, base.b, 1.0))
+	ci.draw_circle(led + Vector2(-1.7, -1.9), 1.7, Color(1.0, 1.0, 1.0, 0.85))
+
+
+func _draw_cigarette_hud() -> void:
+	# A lit cigarette that burns down from the ember as the smoke depletes.
+	var ci: Control = _cigarette_hud
+	var cvs: RID = ci.get_canvas_item()
+	var w: float = ci.size.x
+	var h: float = ci.size.y
+
+	if not hud_in_depth:
+		_draw_cigarette_simple(ci)
+		return
+
+	var cy: float = h - 12.0
+	var cig_h: float = 15.0
+	var top: float = cy - cig_h * 0.5
+
+	var left_margin: float = 8.0
+	var right_margin: float = 8.0
+	var filter_w: float = 46.0
+	var filter_left: float = w - right_margin - filter_w
+	var paper_full: float = filter_left - left_margin
+	var frac: float = clampf(_cigarette_frac, 0.0, 1.0)
+	var paper_len: float = paper_full * frac
+	var paper_left: float = filter_left - paper_len
+
+	# unburned paper body
+	if paper_len > 1.0:
+		var paper: StyleBoxFlat = StyleBoxFlat.new()
+		paper.bg_color = Color(0.95, 0.94, 0.90, 0.98)
+		paper.set_corner_radius_all(3)
+		paper.draw(cvs, Rect2(paper_left, top, paper_len, cig_h))
+		ci.draw_rect(Rect2(paper_left, top + 2.0, paper_len, 2.0), Color(1.0, 1.0, 1.0, 0.5))
+		ci.draw_rect(Rect2(paper_left, top + cig_h - 3.0, paper_len, 2.0), Color(0.0, 0.0, 0.0, 0.10))
+
+	# filter (cork) end
+	var filt: StyleBoxFlat = StyleBoxFlat.new()
+	filt.bg_color = Color(0.80, 0.55, 0.28, 1.0)
+	filt.set_corner_radius_all(3)
+	filt.draw(cvs, Rect2(filter_left, top, filter_w, cig_h))
+	ci.draw_rect(Rect2(filter_left + 2.0, top + 1.0, 2.0, cig_h - 2.0), Color(0.55, 0.36, 0.16, 0.85))
+	ci.draw_rect(Rect2(filter_left + 6.0, top + 1.0, 1.5, cig_h - 2.0), Color(0.55, 0.36, 0.16, 0.6))
+
+	# ember + smoke at the burning tip
+	if frac > 0.01:
+		var flick: float = 0.75 + 0.25 * sin(_cigarette_anim_t * 9.0)
+		var ember: Vector2 = Vector2(paper_left, cy)
+		ci.draw_rect(Rect2(paper_left - 3.0, top, 3.0, cig_h), Color(0.14, 0.12, 0.11, 0.9))  # char ring
+		ci.draw_circle(ember, 9.0 * flick, Color(1.0, 0.35, 0.05, 0.20))
+		ci.draw_circle(ember, 6.0, Color(1.0, 0.45, 0.08, 0.55 * flick))
+		ci.draw_circle(ember, 3.4, Color(1.0, 0.85, 0.35, flick))
+		ci.draw_circle(ember, 1.6, Color(1.0, 1.0, 0.9, 1.0))
+
+		var pts: PackedVector2Array = PackedVector2Array()
+		var n: int = 9
+		for i in range(n + 1):
+			var t: float = float(i) / float(n)
+			var sy: float = ember.y - 5.0 - t * (h - 8.0)
+			var sx: float = ember.x + sin(_cigarette_anim_t * 3.0 + t * TAU) * (2.5 + t * 6.0)
+			pts.append(Vector2(sx, sy))
+		ci.draw_polyline(pts, Color(0.85, 0.85, 0.9, 0.16), 2.0, true)
+
+
+func _draw_collar_simple(ci: Control) -> void:
+	# The original simplistic indicator: a "COLLAR" caption above a solid-colour square.
+	var font: Font = ci.get_theme_default_font()
+	if font:
+		ci.draw_string(font, Vector2(2.0, 14.0), "COLLAR", HORIZONTAL_ALIGNMENT_LEFT, -1, 14, Color(1.0, 1.0, 1.0, 0.7))
+	ci.draw_rect(Rect2(2.0, 20.0, 28.0, 28.0), _collar_belt_color)
+
+
+func _draw_cigarette_simple(ci: Control) -> void:
+	# The original simplistic meter: a dark bar with a tan fill that shrinks from the left.
+	var w: float = ci.size.x
+	var h: float = ci.size.y
+	var bar_w: float = 160.0
+	var bx: float = (w - bar_w) * 0.5
+	var by: float = h - 18.0
+	ci.draw_rect(Rect2(bx, by, bar_w, 10.0), Color(0.0, 0.0, 0.0, 0.5))
+	var frac: float = clampf(_cigarette_frac, 0.0, 1.0)
+	ci.draw_rect(Rect2(bx + 2.0, by + 2.0, (bar_w - 4.0) * frac, 6.0), Color(0.85, 0.7, 0.55, 0.9))
+
+
+func _draw_smoke_timer_panel() -> void:
+	var ci: Control = _smoke_timer_panel
+	var cvs: RID = ci.get_canvas_item()
+	var w: float = ci.size.x
+	var h: float = ci.size.y
+
+	var bezel: StyleBoxFlat = StyleBoxFlat.new()
+	bezel.bg_color = Color(0.06, 0.06, 0.07, 0.82)
+	bezel.set_corner_radius_all(9)
+	bezel.border_color = Color(0.5, 0.12, 0.12, 0.9)
+	bezel.set_border_width_all(2)
+	bezel.draw(cvs, Rect2(0.0, 0.0, w, h))
+
+	var screen: StyleBoxFlat = StyleBoxFlat.new()
+	screen.bg_color = Color(0.11, 0.02, 0.02, 0.9)
+	screen.set_corner_radius_all(5)
+	screen.draw(cvs, Rect2(5.0, 5.0, w - 10.0, h - 10.0))
+
+	ci.draw_rect(Rect2(5.0, h * 0.5 - 1.0, w - 10.0, 2.0), Color(1.0, 0.2, 0.2, 0.06))  # faint scanline glow
+
+
 func _update_damage_flash(delta: float) -> void:
-	if _damage_flash_property != "" and _player and is_instance_valid(_player) and _damage_flash_property in _player:
+	if _player_class_name == INFECTION_FLASH_CLASS:
+		_update_infection_flash()
+	elif _damage_flash_property != "" and _player and is_instance_valid(_player) and _damage_flash_property in _player:
 		var current: int = int(_player.get(_damage_flash_property))
 		if current < _damage_flash_last_value:
 			_damage_flash_alpha = DAMAGE_FLASH_PEAK_ALPHA
@@ -1031,6 +1362,15 @@ func _update_damage_flash(delta: float) -> void:
 	_update_one_life_overlay(delta)
 
 
+func _update_infection_flash() -> void:
+	if _player == null or not is_instance_valid(_player):
+		return
+	var infected: bool = "is_infected" in _player and bool(_player.get("is_infected"))
+	var is_active: bool = "active" in _player and bool(_player.get("active"))
+	if infected and not is_active:  # is_infected flips instantly, but active only comes back after the ~5s transformation anim -- flash for exactly that window
+		_damage_flash_alpha = DAMAGE_FLASH_PEAK_ALPHA
+
+
 func _update_one_life_overlay(delta: float) -> void:
 	var show: bool = (_damage_flash_property != "" and _damage_flash_last_value == 1)
 	_one_life_overlay.visible = show
@@ -1051,41 +1391,65 @@ func _compute_damage_shake_offset() -> Vector3:
 
 func _hide_class_specific_hud() -> void:
 	_one_life_overlay.visible = false
-	_collar_indicator.visible = false
-	_collar_indicator_label.visible = false
-	_cigarette_bar_bg.visible = false
-	_cigarette_bar_fill.visible = false
+	_collar_belt.visible = false
+	_cigarette_hud.visible = false
+	_smoke_timer_panel.visible = false
 
 
 func _update_collar_indicator() -> void:
 	if _player_class_name != &"ExplodingCollarRacePlayer" or _player == null or not is_instance_valid(_player):
-		_collar_indicator.visible = false
-		_collar_indicator_label.visible = false
+		_collar_belt.visible = false
 		return
 	if not ("collar_light_material" in _player):
-		_collar_indicator.visible = false
-		_collar_indicator_label.visible = false
+		_collar_belt.visible = false
 		return
 	var mat = _player.get("collar_light_material")
 	if mat == null:
-		_collar_indicator.visible = false
-		_collar_indicator_label.visible = false
+		_collar_belt.visible = false
 		return
-	_collar_indicator.color = (mat as StandardMaterial3D).albedo_color
-	_collar_indicator.visible = true
-	_collar_indicator_label.visible = true
+	_collar_belt_color = (mat as StandardMaterial3D).albedo_color
+	_collar_belt_pulse += get_process_delta_time() * 6.5
+	_collar_belt.visible = true
+	_collar_belt.queue_redraw()
 
 
 func _update_smoke_break_hud() -> void:
 	if _player_class_name != &"SmokeBreakPlayer" or _player == null or not is_instance_valid(_player) or not ("cigarette_left" in _player):
-		_cigarette_bar_bg.visible = false
-		_cigarette_bar_fill.visible = false
+		_cigarette_hud.visible = false
+		_smoke_timer_panel.visible = false
 		return
-	var left: float = clampf(float(_player.get("cigarette_left")), 0.0, 1.0)
-	_cigarette_bar_bg.visible = true
-	_cigarette_bar_fill.visible = true
-	var full_width: float = 156.0  # matches offset_right(78) - offset_left(-78) in _create_crosshair
-	_cigarette_bar_fill.offset_right = _cigarette_bar_fill.offset_left + full_width * left
+	_cigarette_frac = clampf(float(_player.get("cigarette_left")), 0.0, 1.0)
+	_cigarette_anim_t += get_process_delta_time()
+	_cigarette_hud.visible = true
+	_cigarette_hud.queue_redraw()
+	_update_smoke_break_timer()
+
+
+func _update_smoke_break_timer() -> void:
+	# Mirror the minigame's own countdown Label3D (kept in sync on every peer via its
+	# call_local tick RPC) so the HUD timer reads identically on host and clients.
+	if _smoke_timer_source == null or not is_instance_valid(_smoke_timer_source):
+		_smoke_timer_source = _find_smoke_timer_label()
+	var txt: String = ""
+	if _smoke_timer_source != null and is_instance_valid(_smoke_timer_source):
+		txt = String(_smoke_timer_source.get("text"))
+	if txt == "":
+		_smoke_timer_panel.visible = false
+		return
+	_smoke_timer_label.text = txt
+	_smoke_timer_panel.visible = true
+	_smoke_timer_panel.queue_redraw()
+
+
+func _find_smoke_timer_label() -> Node:
+	var cur: Node = _player
+	while cur != null:
+		if "timer_label" in cur:
+			var tl = cur.get("timer_label")
+			if tl != null and is_instance_valid(tl):
+				return tl
+		cur = cur.get_parent()
+	return null
 
 
 func _set_fpv_camera_active(active: bool) -> void:
@@ -1107,8 +1471,11 @@ func _camera_enter_tree() -> void:
 
 func _restore_camera_or_fallback() -> void:
 	_set_fpv_camera_active(false)
-	if _orig_camera and is_instance_valid(_orig_camera):
-		_orig_camera.current = true
+	var game_cam := _find_game_camera()  # the minigame's own overview Camera3D -- the exact view vanilla shows
+	if game_cam == null and _orig_camera != null and is_instance_valid(_orig_camera):
+		game_cam = _orig_camera
+	if game_cam and is_instance_valid(game_cam):
+		game_cam.current = true
 		return
 	var fallback := _find_fallback_camera()
 	if fallback:
@@ -1118,18 +1485,49 @@ func _restore_camera_or_fallback() -> void:
 		print("[fpv_mod] WARNING: no camera found anywhere to restore -- view may go blank")
 
 
+func _find_game_camera(prefer_spectator: bool = false) -> Camera3D:
+	# Walk from the local player up to its Minigame node and return the Camera3D it owns (exported as
+	# `camera` in most games, `camera_3d` in exploding_collar_race/escalator_pit). These minigames
+	# never switch cameras on death, so this is the exact 3rd-person view the game shows a dead player
+	# -- explicitly re-asserting it avoids Godot's unreliable current-camera fallback landing on a
+	# wrong node (the "weird angle" on the spectate hand-off).
+	# prefer_spectator (death only): Duck Hunt's gameplay camera is a per-player first-person-ish cam,
+	# and the minigame owns a separate wide `backup_camera` for spectating -- prefer that on death, but
+	# NOT on a normal camera restore (toggling FPV off while alive should keep the gameplay view).
+	var props: Array = ["camera", "camera_3d"]
+	if prefer_spectator:
+		props = ["backup_camera", "spectate_camera", "camera", "camera_3d"]
+	var cur: Node = _player
+	while cur != null and is_instance_valid(cur):
+		if _script_is_or_extends(cur.get_script(), &"Minigame"):
+			# Read the camera only off the Minigame node itself, never an intermediate player node
+			# (some first-person games hang a per-player camera off the player -- not what we want).
+			for prop in props:
+				if prop in cur:
+					var cam = cur.get(prop)
+					if cam is Camera3D and is_instance_valid(cam) and cam != _camera:
+						return cam as Camera3D
+			return null  # this minigame exports no matching camera -> caller falls back to _orig_camera
+		cur = cur.get_parent()
+	return null
+
+
 func _find_fallback_camera() -> Camera3D:
 	var tree := get_tree()
 	if tree == null:
 		return null
-	return _find_camera_in(tree.root, tree.root)
+	var current_cam := _find_camera_in(tree.root, tree.root, true)  # prefer a camera the game marked current -- a bare DFS can land on an unused per-player rig camera first
+	if current_cam:
+		return current_cam
+	return _find_camera_in(tree.root, tree.root, false)
 
 
-func _find_camera_in(n: Node, root_viewport: Window) -> Camera3D:
+func _find_camera_in(n: Node, root_viewport: Window, require_current: bool) -> Camera3D:
 	if n is Camera3D and n != _camera and n.get_viewport() == root_viewport:
-		return n as Camera3D
+		if not require_current or (n as Camera3D).current:
+			return n as Camera3D
 	for ch in n.get_children():
-		var found := _find_camera_in(ch, root_viewport)
+		var found := _find_camera_in(ch, root_viewport, require_current)
 		if found:
 			return found
 	return null
@@ -1145,6 +1543,8 @@ func _smooth_head_pos_toward(current: Vector3, target: Vector3, delta: float) ->
 
 
 func _process(delta: float) -> void:
+	_update_secret_level_floor(delta)
+
 	if _process_lobby_fpv(delta):
 		return
 
@@ -1157,9 +1557,29 @@ func _process(delta: float) -> void:
 		_accum = 0.0
 		_rescan_player()
 
+	if _yaw_reseed_pending:
+		_yaw_reseed_timer += delta
+		if _ever_active or _yaw_reseed_timer >= YAW_RESEED_DELAY:
+			_yaw_reseed_pending = false
+			if not _ever_active and _player != null and is_instance_valid(_player):
+				_seed_yaw(CAMERA_TUNING_OVERRIDES.get(_player_class_name, {}))
+
 	var have_rig := (_player != null and is_instance_valid(_player)
 		and _skeleton != null and is_instance_valid(_skeleton) and _head_bone_idx >= 0)
 	var active := have_rig and _player_is_active()
+
+	# Forklift: the ONLY time the forklift leaves first person is the crane "take the package away"
+	# tie scene -- the between-round crate removal (crate_manager.remove_indicies_after_move is
+	# non-empty on every peer). Turn FPV fully off for it, then resume. A normal kill/elimination
+	# is NOT this scene, so it falls through and stays in FPV (death-cam "stay") like every other game.
+	if have_rig and _player_class_name == &"ForkliftCertifiedVehicle":
+		if _is_forklift_crate_pickup_active():
+			_forklift_third_person_handoff()
+			return
+		elif _forklift_third_person_active:
+			_forklift_third_person_active = false
+			_snap_head_smoothing = true
+			_end_death_cam()  # package scene over -- back into the normal FPV / death-cam flow
 
 	if _dying:
 		if active:
@@ -1192,6 +1612,14 @@ func _process(delta: float) -> void:
 		return
 
 	if not active:
+		# Recycle: survivors are set inactive at round end while the round's loser is crushed. That is
+		# NOT death for them -- keep them in first person until their OWN is_dead flips. Isolated to
+		# Recycle; leaves every other minigame's death cam untouched.
+		if (_player_class_name == &"BurnRecyclePlayer" and _ever_active
+				and not ("is_dead" in _player and bool(_player.get("is_dead")))):
+			_update_mouse_capture()
+			_render_head_cam(delta, false)
+			return
 		if _ever_active:
 			_process_death_cam(delta)
 			return
@@ -1217,6 +1645,9 @@ func _compute_eye_offset() -> Vector3:
 func _render_head_cam(delta: float, active: bool) -> void:
 	_apply_controller_look(delta)
 
+	if active:
+		_update_manual_relock()
+
 	if _follow_rig_yaw and _visuals and is_instance_valid(_visuals):
 		_yaw = _visuals.global_rotation.y + _follow_yaw_base + _look_yaw_offset
 
@@ -1225,10 +1656,17 @@ func _render_head_cam(delta: float, active: bool) -> void:
 
 	var target_head_pos: Vector3
 	if _player_class_name == &"SmokeBreakPlayer" and _smoke_break_cigarette_node != null and is_instance_valid(_smoke_break_cigarette_node):
-		var seat_back: Vector3 = Basis(Vector3.UP, _yaw_lock_center) * Vector3(0, 0, 1)
-		target_head_pos = (_smoke_break_cigarette_node.global_position
-			+ Vector3.UP * SMOKE_BREAK_CIGARETTE_EYE_UP
-			+ seat_back * SMOKE_BREAK_CIGARETTE_EYE_BACK)
+		var cig_finished: bool = "finished" in _player and bool(_player.get("finished"))
+		if cig_finished:
+			if not _smoke_break_finish_locked:
+				_smoke_break_finish_locked = true
+				_smoke_break_locked_head_pos = _smoothed_head_pos  # freeze here -- cig_scale_parent keeps drifting into the torso through the crossed-hands finish anim
+			target_head_pos = _smoke_break_locked_head_pos
+		else:
+			var seat_back: Vector3 = Basis(Vector3.UP, _yaw_lock_center) * Vector3(0, 0, 1)
+			target_head_pos = (_smoke_break_cigarette_node.global_position
+				+ Vector3.UP * SMOKE_BREAK_CIGARETTE_EYE_UP
+				+ seat_back * SMOKE_BREAK_CIGARETTE_EYE_BACK)
 	else:
 		target_head_pos = head_xform.origin + _compute_eye_offset()
 
@@ -1289,9 +1727,8 @@ func _process_death_cam(delta: float) -> void:
 		_spectate_release("round over")
 		return
 
-	if _player_class_name == &"ForkliftCertifiedVehicle" and _is_forklift_crate_pickup_active():
-		_spectate_release("forklift: crate tie-break pickup in progress -- third person")
-		return
+	# (Forklift no longer reaches the death cam -- its between-round inactivity is intercepted in
+	# _process and handed to 3rd person via _forklift_third_person_handoff.)
 
 	var elapsed: float = DEATH_CAM_SAFETY_TIME - _dying_timer
 
@@ -1328,6 +1765,10 @@ func _process_death_cam(delta: float) -> void:
 			if corpse_visible:
 				_set_death_black(0.0)
 				_death_apply_camera(_death_ride_corpse())
+			elif _player_class_name == &"DuckHuntDuckPlayer":
+				# Runner reached the exit and left (the duck node is hidden, not killed) -- there's no
+				# corpse to watch, so turn FPV off straight to the game's spectator camera, like Minefield.
+				_spectate_release("duck reached exit -> spectate")
 			else:
 				_set_death_black(1.0)  # instant crush, nothing to watch -> black
 				_death_apply_camera(_dying_anchor)
@@ -1390,9 +1831,14 @@ func _spectate_release(reason: String) -> void:
 	_debris_grab_collision = null
 	_debris_grab_original_shape = null
 	_set_fpv_camera_active(false)
-	var game_cam := _find_fallback_camera()
+	# Explicitly re-assert the game's own spectator/overview camera. These games never switch cameras
+	# on death, so this is the exact vanilla 3rd-person view; don't trust Godot's current-camera
+	# fallback. prefer_spectator picks Duck Hunt's wide `backup_camera` over its per-player duck cam.
+	var game_cam := _find_game_camera(true)
 	if game_cam == null and _orig_camera != null and is_instance_valid(_orig_camera):
-		game_cam = _orig_camera
+		game_cam = _orig_camera  # cached at lock = the same minigame camera
+	if game_cam == null:
+		game_cam = _find_fallback_camera()
 	if game_cam and is_instance_valid(game_cam):
 		game_cam.current = true
 	else:
@@ -1430,6 +1876,21 @@ func _is_forklift_crate_pickup_active() -> bool:
 		return false
 	var arr = _forklift_crate_manager.get("remove_indicies_after_move")
 	return typeof(arr) == TYPE_ARRAY and not (arr as Array).is_empty()
+
+
+func _forklift_third_person_handoff() -> void:
+	# Release first person to the game's own camera for the whole between-round window and leave it
+	# there (don't re-assert FPV each frame), so the crane cutscene plays in normal 3rd person.
+	if _forklift_third_person_active:
+		return
+	_forklift_third_person_active = true
+	_was_active = false
+	_end_death_cam()
+	_restore_camera_or_fallback()  # forklift never swaps cameras, so this is the normal 3rd-person view
+	if _mouse_captured_by_us:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+		_mouse_captured_by_us = false
+	print("[fpv_mod] forklift inactive (round transition / crate cutscene) -- handed to 3rd person")
 
 
 func _find_nearby_hat_gib(center: Vector3) -> Node3D:
@@ -1646,6 +2107,50 @@ func _on_pause_closed() -> void:
 
 
 
+func _seed_yaw(tuning: Dictionary) -> void:
+	if "scene_rotation" in _player:
+		_movement_base_yaw = deg_to_rad(float(_player.get("scene_rotation")))
+	else:
+		_movement_base_yaw = 0.0
+
+	if bool(tuning.get("yaw_from_player_body", false)):
+		_yaw = (_player as Node3D).global_rotation.y
+	elif _visuals:
+		_yaw = _visuals.global_rotation.y
+	else:
+		_yaw = _movement_base_yaw
+
+	_pitch = deg_to_rad(float(tuning.get("pitch_offset_deg", 0.0)))
+
+	if _follow_rig_yaw:
+		_follow_yaw_base = deg_to_rad(float(tuning.get("yaw_offset_deg", 0.0)))
+	else:
+		_follow_yaw_base = 0.0
+		_yaw += deg_to_rad(float(tuning.get("yaw_offset_deg", 0.0)))
+	_yaw_lock_center = _yaw
+	_look_yaw_offset = 0.0
+
+
+func _update_manual_relock() -> void:
+	if not experimental_manual_relock_enabled or _movement_rotate_active:
+		_relock_key_was_down = false
+		return
+	if _player == null or not is_instance_valid(_player):
+		_relock_key_was_down = false
+		return
+
+	var down := Input.is_key_pressed(MANUAL_RELOCK_KEY)
+	if not down:
+		var dev := _look_joypad_device()
+		if dev >= 0 and Input.is_joy_button_pressed(dev, JOY_BUTTON_LEFT_SHOULDER):
+			down = true
+
+	if down and not _relock_key_was_down:
+		_seed_yaw(CAMERA_TUNING_OVERRIDES.get(_player_class_name, {}))
+		print("[fpv_mod] manual re-lock: view re-centered for '", _player_class_name, "'")
+	_relock_key_was_down = down
+
+
 func _rescan_player() -> void:
 	var tree := get_tree()
 	var gm := get_node_or_null("/root/GameManager")
@@ -1737,12 +2242,15 @@ func _rescan_player() -> void:
 		_damage_flash_rect.color = Color(DAMAGE_FLASH_COLOR.r, DAMAGE_FLASH_COLOR.g, DAMAGE_FLASH_COLOR.b, 0.0)
 
 		_smoke_break_cigarette_node = null
+		_smoke_break_finish_locked = false
+		_smoke_timer_source = null
 		if _player_class_name == &"SmokeBreakPlayer" and "anim_handler" in player_node:
 			var anim_h = player_node.get("anim_handler")
 			if anim_h and is_instance_valid(anim_h) and "cig_scale_parent" in anim_h:
 				_smoke_break_cigarette_node = anim_h.get("cig_scale_parent")
 
 		_forklift_crate_manager = null
+		_forklift_third_person_active = false
 		if _player_class_name == &"ForkliftCertifiedVehicle":
 			_forklift_crate_manager = _resolve_forklift_crate_manager(player_node)
 
@@ -1769,28 +2277,10 @@ func _rescan_player() -> void:
 		_pitch_down_limit_rad = deg_to_rad(float(tuning.get("pitch_down_limit_deg", rad_to_deg(PITCH_LIMIT))))
 		_freeze_body = bool(tuning.get("freeze_body", false))
 		_follow_rig_yaw = bool(tuning.get("follow_rig_yaw", false))
-		_look_yaw_offset = 0.0
 
-		if "scene_rotation" in player_node:
-			_movement_base_yaw = deg_to_rad(float(player_node.get("scene_rotation")))
-		else:
-			_movement_base_yaw = 0.0
-
-		if bool(tuning.get("yaw_from_player_body", false)):
-			_yaw = (_player as Node3D).global_rotation.y
-		elif _visuals:
-			_yaw = _visuals.global_rotation.y
-		else:
-			_yaw = _movement_base_yaw
-
-		_pitch = deg_to_rad(float(tuning.get("pitch_offset_deg", 0.0)))
-
-		if _follow_rig_yaw:
-			_follow_yaw_base = deg_to_rad(float(tuning.get("yaw_offset_deg", 0.0)))
-		else:
-			_follow_yaw_base = 0.0
-			_yaw += deg_to_rad(float(tuning.get("yaw_offset_deg", 0.0)))
-		_yaw_lock_center = _yaw
+		_seed_yaw(tuning)
+		_yaw_reseed_pending = true
+		_yaw_reseed_timer = 0.0
 
 		var vp_cam := get_viewport().get_camera_3d()
 		if vp_cam and vp_cam != _camera:
@@ -1877,6 +2367,8 @@ func _save_settings() -> void:
 			"enabled": enabled,
 			"lobby_fpv_enabled": lobby_fpv_enabled,
 			"stay_after_body_drop": stay_after_body_drop,
+			"hud_in_depth": hud_in_depth,
+			"experimental_manual_relock_enabled": experimental_manual_relock_enabled,
 			"mouse_sensitivity_mult": _mouse_sensitivity_mult,
 			"controller_sensitivity_mult": _controller_sensitivity_mult,
 		}))
@@ -1894,6 +2386,8 @@ func _load_settings() -> void:
 		enabled = bool(parsed.get("enabled", false))
 		lobby_fpv_enabled = bool(parsed.get("lobby_fpv_enabled", false))
 		stay_after_body_drop = bool(parsed.get("stay_after_body_drop", false))
+		hud_in_depth = bool(parsed.get("hud_in_depth", true))
+		experimental_manual_relock_enabled = bool(parsed.get("experimental_manual_relock_enabled", false))
 		var legacy: float = float(parsed.get("sensitivity_mult", 1.0))
 		_mouse_sensitivity_mult = float(parsed.get("mouse_sensitivity_mult", legacy))
 		_controller_sensitivity_mult = float(parsed.get("controller_sensitivity_mult", legacy))
