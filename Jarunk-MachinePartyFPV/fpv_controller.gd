@@ -1879,10 +1879,14 @@ func _probe_gun_wall(delta: float) -> void:
 		if mi == _gun_wall_clone:
 			continue
 		var world_aabb: AABB = mi.global_transform * mi.get_aabb()
+		# Skip big shells that enclose the camera (blockout / backdrop) -- their AABB "hits" the ray at
+		# the camera position (0m) and would shadow the actual wall we're looking at.
+		if world_aabb.has_point(from):
+			continue
 		var hit = world_aabb.intersects_ray(from, dir)
 		if hit != null:
 			var d: float = from.distance_to(hit)
-			if d < best_dist:
+			if d > 0.25 and d < best_dist:
 				best_dist = d
 				best_name = String(mi.name)
 	if best_name != "" and best_name != _gun_probe_last:
