@@ -2,7 +2,7 @@
   "id": "first_person_view",
   "name": "Jarunk-MachinePartyFPV",
   "author": "Jarunk",
-  "version": "1.6.34",
+  "version": "1.6.35",
   "entry": "main.gd",
   "priority": 0,
   "requires": []

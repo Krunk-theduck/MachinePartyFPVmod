@@ -1850,9 +1850,9 @@ func _update_gun_wall(delta: float) -> void:
 		var a := verts[i0]
 		var b := verts[i1]
 		var c := verts[i2]
-		var ua := uvs[i0] if have_uv else Vector2.ZERO
-		var ub := uvs[i1] if have_uv else Vector2.ZERO
-		var uc := uvs[i2] if have_uv else Vector2.ZERO
+		var ua: Vector2 = uvs[i0] if have_uv else Vector2.ZERO
+		var ub: Vector2 = uvs[i1] if have_uv else Vector2.ZERO
+		var uc: Vector2 = uvs[i2] if have_uv else Vector2.ZERO
 		_gw_face(st, flat_x, a, b, c, ua, ub, uc, false)  # front face (flush)
 		_gw_face(st, back_x, a, c, b, ua, uc, ub, true)    # back face (reversed winding)
 		# tally the 3 edges so we can find the boundary (outer edge + each window's perimeter)
@@ -1890,7 +1890,7 @@ func _update_gun_wall(delta: float) -> void:
 
 func _gw_face(st: SurfaceTool, x: float, a: Vector3, b: Vector3, c: Vector3, ua: Vector2, ub: Vector2, uc: Vector2, back: bool) -> void:
 	# One triangle of the wall panel, in the plane x=const, using a/b/c's y,z. `back` faces the other way.
-	var nrm := Vector3(1, 0, 0) if back else Vector3(-1, 0, 0)
+	var nrm: Vector3 = Vector3(1, 0, 0) if back else Vector3(-1, 0, 0)
 	st.set_normal(nrm); st.set_uv(ua); st.add_vertex(Vector3(x, a.y, a.z))
 	st.set_normal(nrm); st.set_uv(ub); st.add_vertex(Vector3(x, b.y, b.z))
 	st.set_normal(nrm); st.set_uv(uc); st.add_vertex(Vector3(x, c.y, c.z))
