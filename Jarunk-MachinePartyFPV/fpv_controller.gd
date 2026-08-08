@@ -128,11 +128,11 @@ const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"  # parent that holds 
 # window/pillar details sitting on it. We clone these as a RIGID GROUP (relative arrangement preserved)
 # and rotate the whole group 180 degrees about the play-area pivot, so a coherent window wall lands on
 # the empty -X side. Identified via the crosshair probe (now retired).
-const GUN_WALL_SOURCE_NAMES := ["background main wall", "desk window", "pipe window", "background pillar"]
+const GUN_WALL_SOURCE_NAMES := ["background main wall"]  # ONLY the wall -- no windows/pipes/pillar clutter
 const GUN_WALL_CLONE_NAME := "fpv_mirrored_window_wall"  # group node holding the clones; also dedupe key
 const GUN_WALL_PIVOT := Vector3(2.0, 0.0, 0.0)  # play-area centre; 180deg-about-Y here mirrors +X wall -> -X
 const GUN_WALL_ENABLED := true
-const GUN_WALL_PROBE := false  # flip true to re-log the art mesh under the FPV crosshair
+const GUN_WALL_PROBE := true  # on: logs the exact art mesh under the FPV crosshair (to confirm the wall node)
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
