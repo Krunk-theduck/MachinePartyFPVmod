@@ -1818,13 +1818,34 @@ func _update_gun_wall(delta: float) -> void:
 	var have_uv := uvs.size() == verts.size()
 	var indexed := idx.size() > 0
 	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
-	# Copy the WHOLE brick surface (the wall is curved and merged with the side walls, so no clean
-	# per-triangle cut works). Mirroring maps the +X wall onto the open -X side and the +Z wall onto the
-	# open -Z side; the opposite sides are open too, so nothing doubles up.
+	# The wall is curved and baked into one mesh with the side walls, so no clean per-triangle cut works.
+	# Instead: mirror the whole brick surface, but emit a triangle ONLY if its mirrored position lands in
+	# EMPTY space (filling the open side). Any triangle whose mirror lands on an existing wall is dropped,
+	# so the room's other walls don't get duplicated.
+	var pivot := shell.get_aabb().get_center()
+	var occ := {}  # quantized occupancy of the original brick triangles (1-unit cells)
+	var cents: PackedVector3Array = PackedVector3Array()
+	for t in tcount:
+		var a: int = idx[t * 3] if indexed else t * 3
+		var b: int = idx[t * 3 + 1] if indexed else t * 3 + 1
+		var c: int = idx[t * 3 + 2] if indexed else t * 3 + 2
+		var ctr := (verts[a] + verts[b] + verts[c]) / 3.0
+		cents.append(ctr)
+		occ[Vector3i(roundi(ctr.x), roundi(ctr.y), roundi(ctr.z))] = true
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var kept := 0
 	for t in tcount:
+		var ctr: Vector3 = cents[t]
+		var m := Vector3(2.0 * pivot.x - ctr.x, ctr.y, 2.0 * pivot.z - ctr.z)  # mirrored centroid
+		var mk := Vector3i(roundi(m.x), roundi(m.y), roundi(m.z))
+		var dup := false
+		for dx in range(-1, 2):
+			for dz in range(-1, 2):
+				if occ.has(Vector3i(mk.x + dx, mk.y, mk.z + dz)):
+					dup = true
+		if dup:
+			continue  # mirror lands on an existing wall -> would duplicate it, skip
 		var i0: int = idx[t * 3] if indexed else t * 3
 		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
