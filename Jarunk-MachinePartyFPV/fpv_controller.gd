@@ -127,6 +127,7 @@ const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
 const GUN_WALL_MINX := 2.5  # only copy triangles whose whole footprint is past this local x -- that's the +X wall the player faces, not the side walls (whose bodies run back to low x). We TRANSLATE (not mirror) this copy straight across to the empty -X side, so the real wall lands faithfully -- windows, brick material and all -- with no inversion.
 const GUN_WALL_CLOSER := 1.6  # shift the copied wall this much toward the play area (+x)
+const GUN_WALL_ZINSET := 0.6  # trim this much off each side (z) edge so the new wall stops short of the corners and doesn't z-fight/overlap the adjacent side walls (which sit right behind, so no gap shows)
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1829,9 +1830,11 @@ func _update_gun_wall(delta: float) -> void:
 	var have_uv := uvs.size() == verts.size()
 	var indexed := idx.size() > 0
 	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
-	# First pass: translated-x range of the kept +X wall, so we can reflect it about its own centre.
+	# First pass: translated-x range (to reflect about the wall's centre) + z range (to inset the edges).
 	var minx := INF
 	var maxx := -INF
+	var minz := INF
+	var maxz := -INF
 	for t in tcount:
 		var j0: int = idx[t * 3] if indexed else t * 3
 		var j1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
@@ -1842,6 +1845,8 @@ func _update_gun_wall(delta: float) -> void:
 			var tx0 := verts[jj].x - dx + GUN_WALL_CLOSER
 			minx = minf(minx, tx0)
 			maxx = maxf(maxx, tx0)
+			minz = minf(minz, verts[jj].z)
+			maxz = maxf(maxz, verts[jj].z)
 	var cx := (minx + maxx) * 0.5
 	# Second pass: copy the wall at full depth, reflected about cx so the thickness/reveals face AWAY
 	# from the player. The reflection is baked into the verts (reversed winding + x-flipped normals) so
@@ -1856,6 +1861,9 @@ func _update_gun_wall(delta: float) -> void:
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
 		if minf(verts[i0].x, minf(verts[i1].x, verts[i2].x)) < GUN_WALL_MINX:
 			continue
+		var cz := (verts[i0].z + verts[i1].z + verts[i2].z) / 3.0
+		if cz < minz + GUN_WALL_ZINSET or cz > maxz - GUN_WALL_ZINSET:
+			continue  # trim the z edges so the wall doesn't overlap the adjacent side walls at the corners
 		for ii in [i0, i2, i1]:  # reversed winding (a reflection flips triangle handedness)
 			if have_n:
 				var n := norms[ii]
