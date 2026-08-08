@@ -1829,6 +1829,24 @@ func _update_gun_wall(delta: float) -> void:
 	var have_uv := uvs.size() == verts.size()
 	var indexed := idx.size() > 0
 	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
+	# First pass: translated-x range of the kept +X wall, so we can reflect it about its own centre.
+	var minx := INF
+	var maxx := -INF
+	for t in tcount:
+		var j0: int = idx[t * 3] if indexed else t * 3
+		var j1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
+		var j2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
+		if minf(verts[j0].x, minf(verts[j1].x, verts[j2].x)) < GUN_WALL_MINX:
+			continue
+		for jj in [j0, j1, j2]:
+			var tx0 := verts[jj].x - dx + GUN_WALL_CLOSER
+			minx = minf(minx, tx0)
+			maxx = maxf(maxx, tx0)
+	var cx := (minx + maxx) * 0.5
+	# Second pass: copy the wall at full depth, reflected about cx so the thickness/reveals face AWAY
+	# from the player. The reflection is baked into the verts (reversed winding + x-flipped normals) so
+	# the face normals stay correct -- that lets the wall's OWN lit brick material light it exactly like
+	# the real wall. (A node-transform reflection would flip the normals and render it pitch black.)
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var kept := 0
@@ -1836,16 +1854,16 @@ func _update_gun_wall(delta: float) -> void:
 		var i0: int = idx[t * 3] if indexed else t * 3
 		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
-		# Only the +X wall the player faces (whole triangle past the cutoff); side walls run to low x.
-		# Copied at FULL depth (real thickness) and shifted straight across onto the -X side.
 		if minf(verts[i0].x, minf(verts[i1].x, verts[i2].x)) < GUN_WALL_MINX:
 			continue
-		for ii in [i0, i1, i2]:
+		for ii in [i0, i2, i1]:  # reversed winding (a reflection flips triangle handedness)
 			if have_n:
-				st.set_normal(norms[ii])
+				var n := norms[ii]
+				st.set_normal(Vector3(-n.x, n.y, n.z))  # x-flipped normal to match the reflection
 			if have_uv:
 				st.set_uv(uvs[ii])
-			st.add_vertex(Vector3(verts[ii].x - dx + GUN_WALL_CLOSER, verts[ii].y, verts[ii].z))
+			var tx := verts[ii].x - dx + GUN_WALL_CLOSER
+			st.add_vertex(Vector3(2.0 * cx - tx, verts[ii].y, verts[ii].z))
 		kept += 1
 	if kept == 0:
 		if not _gun_wall_logged:
@@ -1855,28 +1873,18 @@ func _update_gun_wall(delta: float) -> void:
 	var wall := MeshInstance3D.new()
 	wall.name = GUN_WALL_CLONE_NAME
 	wall.mesh = st.commit()
-	var mat := mesh.surface_get_material(bsurf)  # the wall's own brick material (keeps the correct texture)
+	var mat := mesh.surface_get_material(bsurf)  # the wall's OWN material -> same texture/shading/lighting as the real wall
 	if mat != null:
 		mat = mat.duplicate()
 		if mat is BaseMaterial3D:
-			var bm := mat as BaseMaterial3D
-			bm.cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from the play-area side
-			# The -X corner is unlit AND the X-reflection flips the face normals, so a LIT material renders
-			# pitch black. Self-lit shows the brick regardless; toned down so it isn't washed-out pale.
-			bm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-			bm.albedo_color = Color(0.70, 0.58, 0.50)
+			(mat as BaseMaterial3D).cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from the play-area side
 		wall.material_override = mat
 	art.add_child(wall)
-	wall.global_transform = shell.global_transform
-	# Reflect the copy in X about its own centre so its full thickness (and the window reveals) extends
-	# AWAY from the player -- keeps the real wall depth but stops the frames poking toward you.
-	var wc: Vector3 = wall.global_transform * wall.get_aabb().get_center()
-	var flipx := Basis(Vector3(-1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, 1))
-	wall.global_transform = Transform3D(flipx, wc - flipx * wc) * wall.global_transform
+	wall.global_transform = shell.global_transform  # the reflection is baked into the verts, no node rotation
 	_gun_wall_clone = wall
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
-		print("[fpv_mod] gun wall: copied ", kept, " front-wall tris (full depth, x-reflected) onto the -X side")
+		print("[fpv_mod] gun wall: copied ", kept, " tris (full depth, vert-reflected about x=", cx, ")")
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
