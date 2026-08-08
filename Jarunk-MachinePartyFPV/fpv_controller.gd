@@ -125,7 +125,7 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
-const GUN_WALL_FRONT_X := 3.0  # shell-local x cutoff: X-facing triangles past this = the +X (middle) wall
+const GUN_WALL_DEPTH := 2.5  # keep every wall triangle within this many units of the shell's +X face (gives the wall its depth + window reveals, not just the flat front)
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1819,6 +1819,10 @@ func _update_gun_wall(delta: float) -> void:
 	var have_uv := uvs.size() == verts.size()
 	var indexed := idx.size() > 0
 	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
+	# Everything within GUN_WALL_DEPTH of the shell's +X face is the front wall (its faces, window
+	# reveals and trim); deeper triangles are the side/other walls, which we leave out.
+	var laabb := shell.get_aabb()
+	var cutoff_x := laabb.position.x + laabb.size.x - GUN_WALL_DEPTH
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var kept := 0
@@ -1829,12 +1833,7 @@ func _update_gun_wall(delta: float) -> void:
 		var v0 := verts[i0]
 		var v1 := verts[i1]
 		var v2 := verts[i2]
-		var nrm := (v1 - v0).cross(v2 - v0)
-		if nrm.length() < 0.0000001:
-			continue
-		nrm = nrm.normalized()
-		# keep only the +X-facing wall (X-ish normal, on the +X side of the shell)
-		if absf(nrm.x) < 0.6 or (v0.x + v1.x + v2.x) / 3.0 < GUN_WALL_FRONT_X:
+		if (v0.x + v1.x + v2.x) / 3.0 < cutoff_x:
 			continue
 		for ii in [i0, i1, i2]:
 			if have_n:
