@@ -117,7 +117,7 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 # Firearm Factory: the big inward-facing "fog_catcher" box (a direct child of the minigame) has no
 # material, so it renders solid white -- invisible to the framed 3rd-person cam but a blank wall in
 # FPV. Retexture it with the room's own "metal seawall" wall texture.
-const GUN_WALL_MESH_NAME := "fog_catcher"
+const GUN_WALL_MESH_NAME := ""  # was "fog_catcher" -- that's the SKYBOX shell, not the blank wall. Disabled until the real node name is known.
 const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_brick wall1.png"
 const GUN_WALL_TEXTURE_UID := "uid://bbopvwko13gmf"  # the room's "brick wall1" texture, by resource UID (export-safe fallback)
 const GUN_WALL_UV_SCALE := 26.0
@@ -1736,7 +1736,8 @@ func _render_head_cam(delta: float, active: bool) -> void:
 		_update_collar_indicator()
 		_update_smoke_break_hud()
 		_update_round_timer()
-		_update_gun_wall()
+		if GUN_WALL_MESH_NAME != "":
+			_update_gun_wall()  # disabled until the real blank-wall node is identified (fog_catcher was the skybox)
 
 	_set_fpv_camera_active(true)
 
