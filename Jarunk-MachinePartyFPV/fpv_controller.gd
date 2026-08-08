@@ -1863,7 +1863,7 @@ func _update_gun_wall(delta: float) -> void:
 		tex = load(GUN_WALL_TEXTURE_PATH) as Texture2D
 	if tex != null:
 		mat.albedo_texture = tex
-		mat.albedo_color = Color(0.82, 0.79, 0.75)  # tone the unshaded texture down so it doesn't blow out
+		mat.albedo_color = Color(0.62, 0.50, 0.44)  # darker + warmer so the unshaded brick matches the room's lit walls (was washed-out pale)
 	else:
 		mat.albedo_color = Color(0.40, 0.33, 0.29)
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
