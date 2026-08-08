@@ -1862,7 +1862,11 @@ func _update_gun_wall(delta: float) -> void:
 			(mat as BaseMaterial3D).cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from the play-area side
 		wall.material_override = mat
 	art.add_child(wall)
-	wall.global_transform = shell.global_transform  # no rotation -- the translation is baked into the verts
+	wall.global_transform = shell.global_transform
+	# Rotate the panel 180 degrees about its own vertical centre (user request) so it faces the other way.
+	var wc: Vector3 = wall.global_transform * wall.get_aabb().get_center()
+	var rot180 := Basis(Vector3(-1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, -1))
+	wall.global_transform = Transform3D(rot180, wc - rot180 * wc) * wall.global_transform
 	_gun_wall_clone = wall
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
