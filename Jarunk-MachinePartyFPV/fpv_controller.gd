@@ -1869,7 +1869,7 @@ func _update_gun_wall(delta: float) -> void:
 	_gun_wall_clone = wall
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
-		print("[fpv_mod] gun wall: copied ", kept, " front-wall tris, shifted by ", dx, " onto the -X side")
+		print("[fpv_mod] gun wall: copied ", kept, " front-wall tris, flattened onto x=", flat_x, " (-X side)")
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
