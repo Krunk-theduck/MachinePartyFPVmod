@@ -1819,7 +1819,10 @@ func _update_gun_wall(delta: float) -> void:
 	# across to the empty -X side. A translation (not a mirror) keeps the wall faithful: the recessed 5th
 	# window stays recessed instead of inverting into a bulge, and it uses the wall's own brick material.
 	var aabb := shell.get_aabb()
-	var dx := aabb.size.x  # shift from the +X wall over to the -X boundary (room width)
+	# Flatten every copied vertex onto this single x-plane (the translated front face) so the window
+	# frames/reveals don't stick out toward the player -- the openings become flush cut-outs. This plane
+	# equals the original front (aabb.end.x) shifted across by the room width, plus the CLOSER nudge.
+	var flat_x := aabb.position.x + GUN_WALL_CLOSER
 	var arrays := mesh.surface_get_arrays(bsurf)
 	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
 	var norms: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL] if arrays[Mesh.ARRAY_NORMAL] != null else PackedVector3Array()
@@ -1845,7 +1848,7 @@ func _update_gun_wall(delta: float) -> void:
 				st.set_normal(norms[ii])
 			if have_uv:
 				st.set_uv(uvs[ii])
-			st.add_vertex(Vector3(verts[ii].x - dx + GUN_WALL_CLOSER, verts[ii].y, verts[ii].z))
+			st.add_vertex(Vector3(flat_x, verts[ii].y, verts[ii].z))
 		kept += 1
 	if kept == 0:
 		if not _gun_wall_logged:
