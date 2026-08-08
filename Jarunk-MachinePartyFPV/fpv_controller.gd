@@ -1807,19 +1807,6 @@ func _update_gun_wall() -> void:
 		" room_center=", center, " -> clone=", clone.global_transform.origin)
 
 
-func _find_node_named(n: Node, target: String, budget: Array) -> Node:
-	if budget[0] <= 0:
-		return null
-	budget[0] -= 1
-	if String(n.name) == target:
-		return n
-	for ch in n.get_children():
-		var found := _find_node_named(ch, target, budget)
-		if found:
-			return found
-	return null
-
-
 func _art_group_center(art: Node3D) -> Vector3:
 	# Centre of the combined world AABB of the art root's direct mesh children -> the room's visual
 	# middle, used as the pivot to reflect the source wall to the opposite side.
