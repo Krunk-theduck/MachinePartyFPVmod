@@ -1833,7 +1833,13 @@ func _update_gun_wall(delta: float) -> void:
 		var v0 := verts[i0]
 		var v1 := verts[i1]
 		var v2 := verts[i2]
-		if (v0.x + v1.x + v2.x) / 3.0 < cutoff_x:
+		var nrm := (v1 - v0).cross(v2 - v0)
+		if nrm.length() < 0.0000001:
+			continue
+		# Keep it if it's a wall plane facing along X (front wall, the set-back 5th-window section, and
+		# the back layer -- at ANY depth) OR it's in the front slice (window reveals + trim). This drops
+		# the side walls (they face Z) and the floor/ceiling (face Y).
+		if absf(nrm.normalized().x) < 0.6 and (v0.x + v1.x + v2.x) / 3.0 < cutoff_x:
 			continue
 		for ii in [i0, i1, i2]:
 			if have_n:
