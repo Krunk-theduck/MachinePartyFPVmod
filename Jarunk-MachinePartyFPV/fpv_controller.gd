@@ -125,6 +125,7 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
+const GUN_WALL_SPOT_DEPTH := 6.0  # only keep mirrored geometry within this many units of the far (empty) boundary, so nothing lands on the rest of the map
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1819,36 +1820,22 @@ func _update_gun_wall(delta: float) -> void:
 	var indexed := idx.size() > 0
 	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
 	# The wall is curved and baked into one mesh with the side walls, so no clean per-triangle cut works.
-	# Instead: mirror the whole brick surface, but emit a triangle ONLY if its mirrored position lands in
-	# EMPTY space (filling the open side). Any triangle whose mirror lands on an existing wall is dropped,
-	# so the room's other walls don't get duplicated.
-	var pivot := shell.get_aabb().get_center()
-	var occ := {}  # quantized occupancy of the original brick triangles (1-unit cells)
-	var cents: PackedVector3Array = PackedVector3Array()
-	for t in tcount:
-		var a: int = idx[t * 3] if indexed else t * 3
-		var b: int = idx[t * 3 + 1] if indexed else t * 3 + 1
-		var c: int = idx[t * 3 + 2] if indexed else t * 3 + 2
-		var ctr := (verts[a] + verts[b] + verts[c]) / 3.0
-		cents.append(ctr)
-		occ[Vector3i(roundi(ctr.x), roundi(ctr.y), roundi(ctr.z))] = true
+	# Mirror the whole brick surface across the room, but only KEEP triangles whose mirror lands in the
+	# empty spot (within GUN_WALL_SPOT_DEPTH of the far boundary). Everything else is dropped, so the rest
+	# of the map is left untouched -- no duplicated walls. The facing wall mirrors into the empty spot.
+	var aabb := shell.get_aabb()
+	var pivot := aabb.get_center()
+	var clip_x := aabb.position.x + GUN_WALL_SPOT_DEPTH  # mirrored x must be past this (toward the empty side)
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var kept := 0
 	for t in tcount:
-		var ctr: Vector3 = cents[t]
-		var m := Vector3(2.0 * pivot.x - ctr.x, ctr.y, 2.0 * pivot.z - ctr.z)  # mirrored centroid
-		var mk := Vector3i(roundi(m.x), roundi(m.y), roundi(m.z))
-		var dup := false
-		for dx in range(-1, 2):
-			for dz in range(-1, 2):
-				if occ.has(Vector3i(mk.x + dx, mk.y, mk.z + dz)):
-					dup = true
-		if dup:
-			continue  # mirror lands on an existing wall -> would duplicate it, skip
 		var i0: int = idx[t * 3] if indexed else t * 3
 		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
+		var mirrored_x := 2.0 * pivot.x - (verts[i0].x + verts[i1].x + verts[i2].x) / 3.0
+		if mirrored_x > clip_x:
+			continue  # lands outside the empty spot -> skip, so the rest of the map is untouched
 		for ii in [i0, i1, i2]:
 			if have_n:
 				st.set_normal(norms[ii])
