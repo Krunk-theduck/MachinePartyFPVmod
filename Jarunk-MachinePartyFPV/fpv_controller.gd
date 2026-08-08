@@ -124,13 +124,15 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"  # parent that holds all the room's wall meshes
 # First name that resolves to a MeshInstance3D under the art root wins. Order = best guess for the
 # windowed "middle" wall; reorder/extend if a different mesh turns out to be the one with the windows.
-const GUN_WALL_SOURCE_NAMES := ["background main wall", "blockout mesh", "background wall"]
-const GUN_WALL_CLONE_NAME := "fpv_mirrored_window_wall"  # our added copy; also used to avoid duplicating it
-# The room's wall meshes are decomposed oddly (a giant backdrop shell + segmented walls), so the source
-# name can't be picked blindly. PROBE logs the art mesh under the FPV crosshair so we can name the real
-# window wall; ENABLED stays off until that name is confirmed, so no wrong wall gets spawned meanwhile.
-const GUN_WALL_ENABLED := false
-const GUN_WALL_PROBE := true
+# The +X window wall the player faces is a COMPOSITE at varying depths: the big brick backdrop plus the
+# window/pillar details sitting on it. We clone these as a RIGID GROUP (relative arrangement preserved)
+# and rotate the whole group 180 degrees about the play-area pivot, so a coherent window wall lands on
+# the empty -X side. Identified via the crosshair probe (now retired).
+const GUN_WALL_SOURCE_NAMES := ["background main wall", "desk window", "pipe window", "background pillar"]
+const GUN_WALL_CLONE_NAME := "fpv_mirrored_window_wall"  # group node holding the clones; also dedupe key
+const GUN_WALL_PIVOT := Vector3(2.0, 0.0, 0.0)  # play-area centre; 180deg-about-Y here mirrors +X wall -> -X
+const GUN_WALL_ENABLED := true
+const GUN_WALL_PROBE := false  # flip true to re-log the art mesh under the FPV crosshair
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -207,7 +209,7 @@ var _smoke_timer_label: Label
 var _smoke_timer_font: Font = null
 var _smoke_timer_source: Node = null # the minigame's own timer label we mirror (kept in sync on every peer)
 var _round_timer_green: bool = false  # true = Forklift (green digits/bezel), false = Smoke Break (red)
-var _gun_wall_clone: MeshInstance3D = null  # our duplicated window wall, placed on the empty opposite side
+var _gun_wall_clone: Node3D = null  # group node holding our mirrored window-wall clones (empty -X side)
 var _gun_wall_logged: bool = false  # one-shot diagnostic if we can't find a source wall to duplicate
 var _gun_probe_last: String = ""  # last art-mesh name the crosshair probe reported (log only on change)
 var _gun_probe_accum: float = 0.0  # throttle timer for the crosshair probe
@@ -1773,16 +1775,15 @@ func _find_mesh_named(n: Node, mesh_name: String, budget: Array) -> MeshInstance
 
 
 func _update_gun_wall(delta: float) -> void:
-	# Firearm Factory only: the room is missing its 4th wall (open side -> you see the skybox in FPV).
-	# Duplicate the existing windowed "middle" wall and place the copy on the empty opposite side by
-	# rotating it 180 degrees around the room's vertical centre axis. A real rotation (not a mirror /
-	# negative scale) keeps the mesh normals, lighting and texture correct and makes it face inward.
-	# Client-side and visual-only: it just adds a static wall to this client's scene.
+	# Firearm Factory only: the room's 4th wall is missing (open -X side -> skybox in FPV). Clone the
+	# +X window-wall meshes as a RIGID GROUP and rotate that group 180 degrees about the play-area pivot,
+	# so a coherent copy (backdrop + windows + pillar, relative arrangement intact) lands on the empty
+	# -X side. Client-side, visual-only: just adds static meshes to this client's scene.
 	if _player_class_name != &"ManufactureGunPlayer":
 		return
-	_probe_gun_wall(delta)  # identify the real window wall by looking at it (logs the mesh under the crosshair)
+	_probe_gun_wall(delta)  # (no-op unless GUN_WALL_PROBE) -- logs the art mesh under the FPV crosshair
 	if not GUN_WALL_ENABLED:
-		return  # auto-clone held off until the correct window-wall node is confirmed via the probe
+		return
 	if _gun_wall_clone != null and is_instance_valid(_gun_wall_clone):
 		return
 	var tree := get_tree()
@@ -1791,55 +1792,35 @@ func _update_gun_wall(delta: float) -> void:
 	var art := _find_node_named(tree.root, GUN_WALL_ART_ROOT, [SCAN_BUDGET])
 	if art == null or not (art is Node3D):
 		return
-	# Don't create a second copy if one already exists in the scene (e.g. after a respawn/lock).
+	# Don't build a second copy if one already exists (e.g. after a respawn/lock).
 	var existing := art.get_node_or_null(NodePath(GUN_WALL_CLONE_NAME))
-	if existing is MeshInstance3D:
-		_gun_wall_clone = existing as MeshInstance3D
+	if existing is Node3D:
+		_gun_wall_clone = existing as Node3D
 		return
-	# Find the source wall to duplicate.
-	var src: MeshInstance3D = null
-	for nm in GUN_WALL_SOURCE_NAMES:
-		src = _find_mesh_named(art, String(nm), [SCAN_BUDGET])
-		if src != null:
-			break
-	if src == null:
-		if not _gun_wall_logged:
-			_gun_wall_logged = true
-			print("[fpv_mod] gun wall: no source wall found under '", GUN_WALL_ART_ROOT,
-				"' (tried ", GUN_WALL_SOURCE_NAMES, ")")
-		return
-	var center := _art_group_center(art as Node3D)
-	var clone := src.duplicate() as MeshInstance3D
-	if clone == null:
-		return
-	clone.name = GUN_WALL_CLONE_NAME
-	art.add_child(clone)
-	# 180 deg about Y, pivoted on `center`:  p -> rot*(p - center) + center
+	# The group's world transform is a 180deg-about-Y reflection through the pivot; each clone parented
+	# under it inherits that reflection while keeping its original relative position (its world transform
+	# becomes the clone's local, because the art root is at identity).
+	var group := Node3D.new()
+	group.name = GUN_WALL_CLONE_NAME
+	art.add_child(group)
 	var rot := Basis(Vector3(-1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, -1))
-	var pivot := Transform3D(rot, center - rot * center)
-	clone.global_transform = pivot * src.global_transform
-	_gun_wall_clone = clone
-	print("[fpv_mod] gun wall: duplicated '", src.name, "' src=", src.global_transform.origin,
-		" room_center=", center, " -> clone=", clone.global_transform.origin)
-
-
-func _art_group_center(art: Node3D) -> Vector3:
-	# Centre of the combined world AABB of the art root's direct mesh children -> the room's visual
-	# middle, used as the pivot to reflect the source wall to the opposite side.
-	var acc := AABB()
-	var have := false
-	for ch in art.get_children():
-		if ch is MeshInstance3D:
-			var mi := ch as MeshInstance3D
-			var world_aabb: AABB = mi.global_transform * mi.get_aabb()
-			if not have:
-				acc = world_aabb
-				have = true
-			else:
-				acc = acc.merge(world_aabb)
-	if not have:
-		return art.global_transform.origin
-	return acc.get_center()
+	group.global_transform = Transform3D(rot, GUN_WALL_PIVOT - rot * GUN_WALL_PIVOT)
+	var made := 0
+	for nm in GUN_WALL_SOURCE_NAMES:
+		var src := _find_mesh_named(art, String(nm), [SCAN_BUDGET])
+		if src == null:
+			continue
+		var clone := src.duplicate() as MeshInstance3D
+		if clone == null:
+			continue
+		group.add_child(clone)
+		clone.transform = src.global_transform
+		made += 1
+	_gun_wall_clone = group
+	if not _gun_wall_logged:
+		_gun_wall_logged = true
+		print("[fpv_mod] gun wall: mirrored window wall built (", made, "/",
+			GUN_WALL_SOURCE_NAMES.size(), " meshes) about pivot ", GUN_WALL_PIVOT)
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
