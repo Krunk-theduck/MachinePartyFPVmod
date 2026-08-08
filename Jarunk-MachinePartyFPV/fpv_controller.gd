@@ -125,7 +125,8 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
-const GUN_WALL_SPOT_DEPTH := 1.8  # keep mirrored geometry within this many units of the far (empty) boundary; verified in-source that this drops the set-back 5th-window section (which mirrors into a proud "bulge") for a clean flush wall
+const GUN_WALL_FACE_DOT := 0.55  # only take wall faces (|normal.x| >= this) -> the facing wall panel, not the side walls (face Z) or floor (face Y)
+const GUN_WALL_MINX := 2.0  # only faces past this local x (the +X wall region); flattening pulls the set-back 5th-window section onto the wall plane so all 5 sit flush
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1824,8 +1825,7 @@ func _update_gun_wall(delta: float) -> void:
 	# empty spot (within GUN_WALL_SPOT_DEPTH of the far boundary). Everything else is dropped, so the rest
 	# of the map is left untouched -- no duplicated walls. The facing wall mirrors into the empty spot.
 	var aabb := shell.get_aabb()
-	var pivot := aabb.get_center()
-	var clip_x := aabb.position.x + GUN_WALL_SPOT_DEPTH  # mirrored x must be past this (toward the empty side)
+	var front_x := aabb.position.x + aabb.size.x  # the wall's front plane; every face gets flattened here
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var kept := 0
@@ -1833,19 +1833,25 @@ func _update_gun_wall(delta: float) -> void:
 		var i0: int = idx[t * 3] if indexed else t * 3
 		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
-		# Clip by the triangle's FURTHEST-toward-the-room vertex (not its centre): this drops the whole
-		# triangle if any part of it pokes past the empty spot, which is what kills the corner-return
-		# lips that were mirroring outward into the room as stray short walls.
-		var mirrored_x := maxf(2.0 * pivot.x - verts[i0].x,
-			maxf(2.0 * pivot.x - verts[i1].x, 2.0 * pivot.x - verts[i2].x))
-		if mirrored_x > clip_x:
-			continue  # pokes out of the empty spot -> skip, so the rest of the map is untouched
+		var v0 := verts[i0]
+		var v1 := verts[i1]
+		var v2 := verts[i2]
+		var nrm := (v1 - v0).cross(v2 - v0)
+		if nrm.length() < 0.0000001:
+			continue
+		# Only the facing wall panel (perpendicular to X) in the +X region -- excludes side walls (face Z)
+		# and floor (face Y). Flatten every vertex onto the front plane so the set-back 5th-window section
+		# lies flush with the other four; the node transform then mirrors the flat panel onto the gap.
+		if absf(nrm.normalized().x) < GUN_WALL_FACE_DOT:
+			continue
+		if minf(v0.x, minf(v1.x, v2.x)) < GUN_WALL_MINX:
+			continue
 		for ii in [i0, i1, i2]:
 			if have_n:
 				st.set_normal(norms[ii])
 			if have_uv:
 				st.set_uv(uvs[ii])
-			st.add_vertex(verts[ii])
+			st.add_vertex(Vector3(front_x, verts[ii].y, verts[ii].z))
 		kept += 1
 	if kept == 0:
 		if not _gun_wall_logged:
