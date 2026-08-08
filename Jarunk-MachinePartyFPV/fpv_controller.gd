@@ -129,8 +129,8 @@ const GUN_WALL_YAW := 1.5707963  # +90deg about Y -> quad faces +X, toward the p
 const GUN_WALL_TEXTURE_UID := "uid://bbopvwko13gmf"  # room "brick wall1"
 const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_brick wall1.png"
 const GUN_WALL_UV := Vector3(6.0, 3.0, 1.0)  # brick tiling across the quad
-const GUN_WALL_ENABLED := true
-const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
+const GUN_WALL_ENABLED := false  # diagnostic build: constructed wall off while we ID the real wall mesh
+const GUN_WALL_PROBE := true  # log the two nearest art meshes under the FPV crosshair (backdrop excluded)
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -1850,26 +1850,32 @@ func _probe_gun_wall(delta: float) -> void:
 	var dir: Vector3 = -_camera.global_transform.basis.z  # camera forward
 	var meshes: Array = []
 	_collect_meshes(art, meshes, [SCAN_BUDGET])
-	var best_name := ""
-	var best_dist := 1.0e20
+	var hits: Array = []
 	for m in meshes:
 		var mi := m as MeshInstance3D
 		if mi == _gun_wall_clone:
 			continue
-		var world_aabb: AABB = mi.global_transform * mi.get_aabb()
-		# Skip big shells that enclose the camera (blockout / backdrop) -- their AABB "hits" the ray at
-		# the camera position (0m) and would shadow the actual wall we're looking at.
-		if world_aabb.has_point(from):
+		var wa: AABB = mi.global_transform * mi.get_aabb()
+		# Skip shells that enclose the camera (their AABB "hits" at 0m) and the oversized backdrop
+		# (any dim > 40m) -- both have huge boxes that shadow the actual wall we're looking at.
+		if wa.has_point(from):
 			continue
-		var hit = world_aabb.intersects_ray(from, dir)
+		if wa.size.x > 40.0 or wa.size.y > 40.0 or wa.size.z > 40.0:
+			continue
+		var hit = wa.intersects_ray(from, dir)
 		if hit != null:
 			var d: float = from.distance_to(hit)
-			if d > 0.25 and d < best_dist:
-				best_dist = d
-				best_name = String(mi.name)
-	if best_name != "" and best_name != _gun_probe_last:
-		_gun_probe_last = best_name
-		print("[fpv_mod] gun probe: crosshair on '", best_name, "'  (", int(best_dist), "m)")
+			if d > 0.25:
+				hits.append([d, String(mi.name)])
+	if hits.is_empty():
+		return
+	hits.sort_custom(func(a, b): return a[0] < b[0])
+	var label := String(hits[0][1]) + " (" + str(int(hits[0][0])) + "m)"
+	if hits.size() > 1:
+		label += " | " + String(hits[1][1]) + " (" + str(int(hits[1][0])) + "m)"
+	if label != _gun_probe_last:
+		_gun_probe_last = label
+		print("[fpv_mod] gun probe: ", label)
 
 
 func _class_from_skeleton_owner() -> StringName:
