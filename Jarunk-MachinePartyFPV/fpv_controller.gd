@@ -125,7 +125,7 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
-const GUN_WALL_SPOT_DEPTH := 3.0  # keep mirrored geometry within this many units of the far (empty) boundary; verified in-source that this is the clean ceiling -- >3 spills stray wall bits into the play area
+const GUN_WALL_SPOT_DEPTH := 1.8  # keep mirrored geometry within this many units of the far (empty) boundary; verified in-source that this drops the set-back 5th-window section (which mirrors into a proud "bulge") for a clean flush wall
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
