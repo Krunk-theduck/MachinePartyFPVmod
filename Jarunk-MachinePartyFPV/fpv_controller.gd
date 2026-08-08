@@ -117,10 +117,15 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 # Firearm Factory: the big inward-facing "fog_catcher" box (a direct child of the minigame) has no
 # material, so it renders solid white -- invisible to the framed 3rd-person cam but a blank wall in
 # FPV. Retexture it with the room's own "metal seawall" wall texture.
-const GUN_WALL_MESH_NAME := ""  # was "fog_catcher" -- that's the SKYBOX shell, not the blank wall. Disabled until the real node name is known.
-const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_brick wall1.png"
-const GUN_WALL_TEXTURE_UID := "uid://bbopvwko13gmf"  # the room's "brick wall1" texture, by resource UID (export-safe fallback)
-const GUN_WALL_UV_SCALE := 26.0
+# Firearm Factory has only 3 real walls -- the 4th side is open, so in FPV you see the skybox there.
+# Rather than paint the skybox (fog_catcher is the whole shell), we DUPLICATE the existing "middle wall
+# with the windows" and drop the copy on the empty opposite side, so the room reads as fully enclosed.
+# The clone carries the source wall's own mesh + texture, so there is no texture guessing.
+const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"  # parent that holds all the room's wall meshes
+# First name that resolves to a MeshInstance3D under the art root wins. Order = best guess for the
+# windowed "middle" wall; reorder/extend if a different mesh turns out to be the one with the windows.
+const GUN_WALL_SOURCE_NAMES := ["background main wall", "blockout mesh", "background wall"]
+const GUN_WALL_CLONE_NAME := "fpv_mirrored_window_wall"  # our added copy; also used to avoid duplicating it
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -197,8 +202,8 @@ var _smoke_timer_label: Label
 var _smoke_timer_font: Font = null
 var _smoke_timer_source: Node = null # the minigame's own timer label we mirror (kept in sync on every peer)
 var _round_timer_green: bool = false  # true = Forklift (green digits/bezel), false = Smoke Break (red)
-var _gun_wall_node: MeshInstance3D = null  # the gun game's blank "fog_catcher" box, once we've retextured it
-var _gun_wall_logged: bool = false  # one-shot diagnostic if we can't find the wall mesh
+var _gun_wall_clone: MeshInstance3D = null  # our duplicated window wall, placed on the empty opposite side
+var _gun_wall_logged: bool = false  # one-shot diagnostic if we can't find a source wall to duplicate
 
 var _debris_grab_collision: CollisionShape3D = null
 var _debris_grab_original_shape: Shape3D = null
@@ -1736,8 +1741,7 @@ func _render_head_cam(delta: float, active: bool) -> void:
 		_update_collar_indicator()
 		_update_smoke_break_hud()
 		_update_round_timer()
-		if GUN_WALL_MESH_NAME != "":
-			_update_gun_wall()  # disabled until the real blank-wall node is identified (fog_catcher was the skybox)
+		_update_gun_wall()
 
 	_set_fpv_camera_active(true)
 
@@ -1756,41 +1760,83 @@ func _find_mesh_named(n: Node, mesh_name: String, budget: Array) -> MeshInstance
 
 
 func _update_gun_wall() -> void:
-	# Firearm Factory only: paint the room's wall texture onto the untextured "fog_catcher" box (a
-	# ~106u inward box that renders solid white in FPV). Searched from the tree root by node name so
-	# it works regardless of the minigame's exact node path; applied once and cached.
-	if _gun_wall_node != null and is_instance_valid(_gun_wall_node):
-		return
+	# Firearm Factory only: the room is missing its 4th wall (open side -> you see the skybox in FPV).
+	# Duplicate the existing windowed "middle" wall and place the copy on the empty opposite side by
+	# rotating it 180 degrees around the room's vertical centre axis. A real rotation (not a mirror /
+	# negative scale) keeps the mesh normals, lighting and texture correct and makes it face inward.
+	# Client-side and visual-only: it just adds a static wall to this client's scene.
 	if _player_class_name != &"ManufactureGunPlayer":
+		return
+	if _gun_wall_clone != null and is_instance_valid(_gun_wall_clone):
 		return
 	var tree := get_tree()
 	if tree == null:
 		return
-	var wall := _find_mesh_named(tree.root, GUN_WALL_MESH_NAME, [SCAN_BUDGET])
-	if wall == null:
+	var art := _find_node_named(tree.root, GUN_WALL_ART_ROOT, [SCAN_BUDGET])
+	if art == null or not (art is Node3D):
+		return
+	# Don't create a second copy if one already exists in the scene (e.g. after a respawn/lock).
+	var existing := art.get_node_or_null(NodePath(GUN_WALL_CLONE_NAME))
+	if existing is MeshInstance3D:
+		_gun_wall_clone = existing as MeshInstance3D
+		return
+	# Find the source wall to duplicate.
+	var src: MeshInstance3D = null
+	for nm in GUN_WALL_SOURCE_NAMES:
+		src = _find_mesh_named(art, String(nm), [SCAN_BUDGET])
+		if src != null:
+			break
+	if src == null:
 		if not _gun_wall_logged:
 			_gun_wall_logged = true
-			print("[fpv_mod] gun wall: no MeshInstance3D named '", GUN_WALL_MESH_NAME, "' found yet")
+			print("[fpv_mod] gun wall: no source wall found under '", GUN_WALL_ART_ROOT,
+				"' (tried ", GUN_WALL_SOURCE_NAMES, ")")
 		return
-	var mat := StandardMaterial3D.new()
-	var tex: Texture2D = load(GUN_WALL_TEXTURE_PATH) as Texture2D
-	if tex == null:
-		tex = load(GUN_WALL_TEXTURE_UID) as Texture2D  # fall back to the resource UID if the path fails
-	# UNSHADED: the fog_catcher shell's back face gets almost no light, so a lit material renders
-	# near-black (that's why it looked "blank"). Self-lit shows the wall texture at a readable,
-	# slightly toned-down brightness regardless of the room lighting.
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	if tex:
-		mat.albedo_texture = tex
-		mat.albedo_color = Color(0.78, 0.76, 0.72)  # tone the unshaded texture down so it doesn't blow out
-		mat.uv1_scale = Vector3(GUN_WALL_UV_SCALE, GUN_WALL_UV_SCALE, 1.0)
-	else:
-		mat.albedo_color = Color(0.34, 0.30, 0.27)  # neutral fallback if the texture can't load
-	mat.cull_mode = BaseMaterial3D.CULL_DISABLED  # the box is flip_faces -- render both sides
-	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS
-	wall.material_override = mat
-	_gun_wall_node = wall
-	print("[fpv_mod] gun wall: textured '", wall.get_path(), "' (texture loaded=", tex != null, ")")
+	var center := _art_group_center(art as Node3D)
+	var clone := src.duplicate() as MeshInstance3D
+	if clone == null:
+		return
+	clone.name = GUN_WALL_CLONE_NAME
+	art.add_child(clone)
+	# 180 deg about Y, pivoted on `center`:  p -> rot*(p - center) + center
+	var rot := Basis(Vector3(-1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, -1))
+	var pivot := Transform3D(rot, center - rot * center)
+	clone.global_transform = pivot * src.global_transform
+	_gun_wall_clone = clone
+	print("[fpv_mod] gun wall: duplicated '", src.name, "' src=", src.global_transform.origin,
+		" room_center=", center, " -> clone=", clone.global_transform.origin)
+
+
+func _find_node_named(n: Node, target: String, budget: Array) -> Node:
+	if budget[0] <= 0:
+		return null
+	budget[0] -= 1
+	if String(n.name) == target:
+		return n
+	for ch in n.get_children():
+		var found := _find_node_named(ch, target, budget)
+		if found:
+			return found
+	return null
+
+
+func _art_group_center(art: Node3D) -> Vector3:
+	# Centre of the combined world AABB of the art root's direct mesh children -> the room's visual
+	# middle, used as the pivot to reflect the source wall to the opposite side.
+	var acc := AABB()
+	var have := false
+	for ch in art.get_children():
+		if ch is MeshInstance3D:
+			var mi := ch as MeshInstance3D
+			var world_aabb: AABB = mi.global_transform * mi.get_aabb()
+			if not have:
+				acc = world_aabb
+				have = true
+			else:
+				acc = acc.merge(world_aabb)
+	if not have:
+		return art.global_transform.origin
+	return acc.get_center()
 
 
 func _class_from_skeleton_owner() -> StringName:
@@ -2385,7 +2431,7 @@ func _rescan_player() -> void:
 		_smoke_break_cigarette_node = null
 		_smoke_break_finish_locked = false
 		_smoke_timer_source = null
-		_gun_wall_node = null
+		_gun_wall_clone = null
 		_gun_wall_logged = false
 		if _player_class_name == &"SmokeBreakPlayer" and "anim_handler" in player_node:
 			var anim_h = player_node.get("anim_handler")
