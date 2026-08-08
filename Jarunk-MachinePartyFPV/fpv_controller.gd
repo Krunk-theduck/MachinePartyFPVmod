@@ -125,7 +125,7 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
-const GUN_WALL_SPOT_DEPTH := 2.5  # only keep mirrored geometry within this many units of the far (empty) boundary; verified in-source that >~3 spills stray wall bits into the play area
+const GUN_WALL_SPOT_DEPTH := 3.0  # keep mirrored geometry within this many units of the far (empty) boundary; verified in-source that this is the clean ceiling -- >3 spills stray wall bits into the play area
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1833,9 +1833,13 @@ func _update_gun_wall(delta: float) -> void:
 		var i0: int = idx[t * 3] if indexed else t * 3
 		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
-		var mirrored_x := 2.0 * pivot.x - (verts[i0].x + verts[i1].x + verts[i2].x) / 3.0
+		# Clip by the triangle's FURTHEST-toward-the-room vertex (not its centre): this drops the whole
+		# triangle if any part of it pokes past the empty spot, which is what kills the corner-return
+		# lips that were mirroring outward into the room as stray short walls.
+		var mirrored_x := maxf(2.0 * pivot.x - verts[i0].x,
+			maxf(2.0 * pivot.x - verts[i1].x, 2.0 * pivot.x - verts[i2].x))
 		if mirrored_x > clip_x:
-			continue  # lands outside the empty spot -> skip, so the rest of the map is untouched
+			continue  # pokes out of the empty spot -> skip, so the rest of the map is untouched
 		for ii in [i0, i1, i2]:
 			if have_n:
 				st.set_normal(norms[ii])
