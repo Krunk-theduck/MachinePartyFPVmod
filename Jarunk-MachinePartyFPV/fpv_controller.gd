@@ -1855,11 +1855,16 @@ func _update_gun_wall(delta: float) -> void:
 	var wall := MeshInstance3D.new()
 	wall.name = GUN_WALL_CLONE_NAME
 	wall.mesh = st.commit()
-	var mat := mesh.surface_get_material(bsurf)  # the wall's own brick material -> correct look/lighting
+	var mat := mesh.surface_get_material(bsurf)  # the wall's own brick material (keeps the correct texture)
 	if mat != null:
 		mat = mat.duplicate()
 		if mat is BaseMaterial3D:
-			(mat as BaseMaterial3D).cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from the play-area side
+			var bm := mat as BaseMaterial3D
+			bm.cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from the play-area side
+			# The -X corner is unlit AND the X-reflection flips the face normals, so a LIT material renders
+			# pitch black. Self-lit shows the brick regardless; toned down so it isn't washed-out pale.
+			bm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+			bm.albedo_color = Color(0.70, 0.58, 0.50)
 		wall.material_override = mat
 	art.add_child(wall)
 	wall.global_transform = shell.global_transform
