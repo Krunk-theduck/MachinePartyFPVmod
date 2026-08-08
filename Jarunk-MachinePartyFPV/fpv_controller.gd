@@ -126,7 +126,8 @@ const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
 const GUN_WALL_MINX := 2.5  # only copy triangles whose whole footprint is past this local x -- that's the +X wall the player faces, not the side walls (whose bodies run back to low x). We TRANSLATE (not mirror) this copy straight across to the empty -X side, so the real wall lands faithfully -- windows, brick material and all -- with no inversion.
-const GUN_WALL_CLOSER := 2.0  # shift the copied wall this much toward the play area (+x) so it sits closer to the player instead of far back at the boundary
+const GUN_WALL_CLOSER := 1.6  # shift the copied wall this much toward the play area (+x); the front face sits here
+const GUN_WALL_THICKNESS := 0.8  # extrude the flattened panel this far BACKWARD (−x, away from player) so it's solid, not paper-thin, while the front stays flush
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1843,12 +1844,21 @@ func _update_gun_wall(delta: float) -> void:
 		# back to low x. Everything kept is shifted straight across by the room width onto the -X side.
 		if minf(verts[i0].x, minf(verts[i1].x, verts[i2].x)) < GUN_WALL_MINX:
 			continue
+		# Front face -- flush at flat_x.
 		for ii in [i0, i1, i2]:
 			if have_n:
 				st.set_normal(norms[ii])
 			if have_uv:
 				st.set_uv(uvs[ii])
 			st.add_vertex(Vector3(flat_x, verts[ii].y, verts[ii].z))
+		# Back face -- same tris extruded back by THICKNESS, winding reversed so the wall reads solid and
+		# each window gets a dark recess between the two layers instead of being a paper cut-out.
+		for ii in [i0, i2, i1]:
+			if have_n:
+				st.set_normal(-norms[ii])
+			if have_uv:
+				st.set_uv(uvs[ii])
+			st.add_vertex(Vector3(flat_x - GUN_WALL_THICKNESS, verts[ii].y, verts[ii].z))
 		kept += 1
 	if kept == 0:
 		if not _gun_wall_logged:
