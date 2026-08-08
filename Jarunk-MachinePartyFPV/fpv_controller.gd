@@ -1835,31 +1835,37 @@ func _update_gun_wall(delta: float) -> void:
 	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var back_x := flat_x - GUN_WALL_THICKNESS
+	var ecount := {}  # edge (y,z pair) -> how many kept tris use it; ==1 means a boundary edge
+	var epts := {}    # edge key -> [Vector3 a, Vector3 b, Vector2 uv_a, Vector2 uv_b]
 	var kept := 0
 	for t in tcount:
 		var i0: int = idx[t * 3] if indexed else t * 3
 		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
 		# Only the +X wall (whole triangle past the cutoff) -> excludes the side walls, whose bodies run
-		# back to low x. Everything kept is shifted straight across by the room width onto the -X side.
+		# back to low x. The kept front panel is flattened to flat_x, then extruded back to back_x.
 		if minf(verts[i0].x, minf(verts[i1].x, verts[i2].x)) < GUN_WALL_MINX:
 			continue
-		# Front face -- flush at flat_x.
-		for ii in [i0, i1, i2]:
-			if have_n:
-				st.set_normal(norms[ii])
-			if have_uv:
-				st.set_uv(uvs[ii])
-			st.add_vertex(Vector3(flat_x, verts[ii].y, verts[ii].z))
-		# Back face -- same tris extruded back by THICKNESS, winding reversed so the wall reads solid and
-		# each window gets a dark recess between the two layers instead of being a paper cut-out.
-		for ii in [i0, i2, i1]:
-			if have_n:
-				st.set_normal(-norms[ii])
-			if have_uv:
-				st.set_uv(uvs[ii])
-			st.add_vertex(Vector3(flat_x - GUN_WALL_THICKNESS, verts[ii].y, verts[ii].z))
+		var a := verts[i0]
+		var b := verts[i1]
+		var c := verts[i2]
+		var ua := uvs[i0] if have_uv else Vector2.ZERO
+		var ub := uvs[i1] if have_uv else Vector2.ZERO
+		var uc := uvs[i2] if have_uv else Vector2.ZERO
+		_gw_face(st, flat_x, a, b, c, ua, ub, uc, false)  # front face (flush)
+		_gw_face(st, back_x, a, c, b, ua, uc, ub, true)    # back face (reversed winding)
+		# tally the 3 edges so we can find the boundary (outer edge + each window's perimeter)
+		_gw_edge(ecount, epts, a, b, ua, ub)
+		_gw_edge(ecount, epts, b, c, ub, uc)
+		_gw_edge(ecount, epts, c, a, uc, ua)
 		kept += 1
+	# Connect front to back along every BOUNDARY edge -> the outer sides + the window reveals, so it's
+	# one solid wall instead of two loose sheets.
+	for key in ecount:
+		if ecount[key] == 1:
+			var e: Array = epts[key]
+			_gw_side(st, flat_x, back_x, e[0], e[1], e[2], e[3])
 	if kept == 0:
 		if not _gun_wall_logged:
 			_gun_wall_logged = true
@@ -1880,6 +1886,51 @@ func _update_gun_wall(delta: float) -> void:
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
 		print("[fpv_mod] gun wall: copied ", kept, " front-wall tris, flattened onto x=", flat_x, " (-X side)")
+
+
+func _gw_face(st: SurfaceTool, x: float, a: Vector3, b: Vector3, c: Vector3, ua: Vector2, ub: Vector2, uc: Vector2, back: bool) -> void:
+	# One triangle of the wall panel, in the plane x=const, using a/b/c's y,z. `back` faces the other way.
+	var nrm := Vector3(1, 0, 0) if back else Vector3(-1, 0, 0)
+	st.set_normal(nrm); st.set_uv(ua); st.add_vertex(Vector3(x, a.y, a.z))
+	st.set_normal(nrm); st.set_uv(ub); st.add_vertex(Vector3(x, b.y, b.z))
+	st.set_normal(nrm); st.set_uv(uc); st.add_vertex(Vector3(x, c.y, c.z))
+
+
+func _gw_ekey(a: Vector3, b: Vector3) -> String:
+	# Order-independent key for an edge, from its two (y,z) endpoints quantised to 1/16 unit.
+	var ay := roundi(a.y * 16.0)
+	var az := roundi(a.z * 16.0)
+	var by := roundi(b.y * 16.0)
+	var bz := roundi(b.z * 16.0)
+	if ay < by or (ay == by and az <= bz):
+		return "%d_%d_%d_%d" % [ay, az, by, bz]
+	return "%d_%d_%d_%d" % [by, bz, ay, az]
+
+
+func _gw_edge(ecount: Dictionary, epts: Dictionary, a: Vector3, b: Vector3, ua: Vector2, ub: Vector2) -> void:
+	var key := _gw_ekey(a, b)
+	if ecount.has(key):
+		ecount[key] += 1
+	else:
+		ecount[key] = 1
+		epts[key] = [a, b, ua, ub]
+
+
+func _gw_side(st: SurfaceTool, xf: float, xb: float, a: Vector3, b: Vector3, ua: Vector2, ub: Vector2) -> void:
+	# A quad bridging front plane (xf) to back plane (xb) along edge a-b -> a window reveal / outer side.
+	var fa := Vector3(xf, a.y, a.z)
+	var fb := Vector3(xf, b.y, b.z)
+	var ba := Vector3(xb, a.y, a.z)
+	var bb := Vector3(xb, b.y, b.z)
+	var nrm := (fb - fa).cross(Vector3(1, 0, 0)).normalized()
+	if nrm.length() < 0.001:
+		nrm = Vector3(0, 1, 0)
+	st.set_normal(nrm); st.set_uv(ua); st.add_vertex(fa)
+	st.set_normal(nrm); st.set_uv(ub); st.add_vertex(fb)
+	st.set_normal(nrm); st.set_uv(ub); st.add_vertex(bb)
+	st.set_normal(nrm); st.set_uv(ua); st.add_vertex(fa)
+	st.set_normal(nrm); st.set_uv(ub); st.add_vertex(bb)
+	st.set_normal(nrm); st.set_uv(ua); st.add_vertex(ba)
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
