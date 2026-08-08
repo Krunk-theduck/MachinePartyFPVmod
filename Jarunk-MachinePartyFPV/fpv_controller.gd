@@ -1848,6 +1848,11 @@ func _update_gun_wall(delta: float) -> void:
 			minz = minf(minz, verts[jj].z)
 			maxz = maxf(maxz, verts[jj].z)
 	var cx := (minx + maxx) * 0.5
+	# Pull both z-edges in by GUN_WALL_ZINSET (scale toward the z-centre) so the wall stops short of the
+	# corners -- symmetric, no dropped triangles, and its bottom edge still meets the floor.
+	var zc := (minz + maxz) * 0.5
+	var zw := maxz - minz
+	var zscale: float = (zw - 2.0 * GUN_WALL_ZINSET) / zw if zw > 0.001 else 1.0
 	# Second pass: copy the wall at full depth, reflected about cx so the thickness/reveals face AWAY
 	# from the player. The reflection is baked into the verts (reversed winding + x-flipped normals) so
 	# the face normals stay correct -- that lets the wall's OWN lit brick material light it exactly like
@@ -1861,9 +1866,6 @@ func _update_gun_wall(delta: float) -> void:
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
 		if minf(verts[i0].x, minf(verts[i1].x, verts[i2].x)) < GUN_WALL_MINX:
 			continue
-		var cz := (verts[i0].z + verts[i1].z + verts[i2].z) / 3.0
-		if cz < minz + GUN_WALL_ZINSET or cz > maxz - GUN_WALL_ZINSET:
-			continue  # trim the z edges so the wall doesn't overlap the adjacent side walls at the corners
 		for ii in [i0, i2, i1]:  # reversed winding (a reflection flips triangle handedness)
 			if have_n:
 				var n := norms[ii]
@@ -1871,7 +1873,8 @@ func _update_gun_wall(delta: float) -> void:
 			if have_uv:
 				st.set_uv(uvs[ii])
 			var tx := verts[ii].x - dx + GUN_WALL_CLOSER
-			st.add_vertex(Vector3(2.0 * cx - tx, verts[ii].y, verts[ii].z))
+			var sz := zc + (verts[ii].z - zc) * zscale
+			st.add_vertex(Vector3(2.0 * cx - tx, verts[ii].y, sz))
 		kept += 1
 	if kept == 0:
 		if not _gun_wall_logged:
