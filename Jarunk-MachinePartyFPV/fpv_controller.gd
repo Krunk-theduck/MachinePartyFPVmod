@@ -117,22 +117,20 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 # Firearm Factory: the big inward-facing "fog_catcher" box (a direct child of the minigame) has no
 # material, so it renders solid white -- invisible to the framed 3rd-person cam but a blank wall in
 # FPV. Retexture it with the room's own "metal seawall" wall texture.
-# Firearm Factory has only 3 real walls -- the 4th side is open, so in FPV you see the skybox there.
-# Rather than paint the skybox (fog_catcher is the whole shell), we DUPLICATE the existing "middle wall
-# with the windows" and drop the copy on the empty opposite side, so the room reads as fully enclosed.
-# The clone carries the source wall's own mesh + texture, so there is no texture guessing.
-const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"  # parent that holds all the room's wall meshes
-# First name that resolves to a MeshInstance3D under the art root wins. Order = best guess for the
-# windowed "middle" wall; reorder/extend if a different mesh turns out to be the one with the windows.
-# The +X window wall the player faces is a COMPOSITE at varying depths: the big brick backdrop plus the
-# window/pillar details sitting on it. We clone these as a RIGID GROUP (relative arrangement preserved)
-# and rotate the whole group 180 degrees about the play-area pivot, so a coherent window wall lands on
-# the empty -X side. Identified via the crosshair probe (now retired).
-const GUN_WALL_SOURCE_NAMES := ["background main wall"]  # ONLY the wall -- no windows/pipes/pillar clutter
-const GUN_WALL_CLONE_NAME := "fpv_mirrored_window_wall"  # group node holding the clones; also dedupe key
-const GUN_WALL_PIVOT := Vector3(2.0, 0.0, 0.0)  # play-area centre; 180deg-about-Y here mirrors +X wall -> -X
+# Firearm Factory's -X side is open (no wall -> skybox in FPV). There is no single flat "middle wall"
+# mesh to copy (the real walls are a big bulky backdrop + a play-area shell + segmented pieces), so we
+# BUILD a brick wall to close the opening, using the room's own "brick wall1" texture, sized to the room.
+# Position/size/uv are tunable below. Client-side, FPV-only (removed when FPV is off).
+const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"  # parent that holds the room's wall meshes
+const GUN_WALL_CLONE_NAME := "fpv_added_wall"  # the wall node we add; also the dedupe key
+const GUN_WALL_POS := Vector3(-9.0, 4.5, -0.6)  # centre of the wall that closes the open -X side
+const GUN_WALL_SIZE := Vector2(26.0, 13.0)  # quad size: width (along Z) x height (along Y)
+const GUN_WALL_YAW := 1.5707963  # +90deg about Y -> quad faces +X, toward the play area
+const GUN_WALL_TEXTURE_UID := "uid://bbopvwko13gmf"  # room "brick wall1"
+const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_brick wall1.png"
+const GUN_WALL_UV := Vector3(6.0, 3.0, 1.0)  # brick tiling across the quad
 const GUN_WALL_ENABLED := true
-const GUN_WALL_PROBE := true  # on: logs the exact art mesh under the FPV crosshair (to confirm the wall node)
+const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -1775,10 +1773,9 @@ func _find_mesh_named(n: Node, mesh_name: String, budget: Array) -> MeshInstance
 
 
 func _update_gun_wall(delta: float) -> void:
-	# Firearm Factory only: the room's 4th wall is missing (open -X side -> skybox in FPV). Clone the
-	# +X window-wall meshes as a RIGID GROUP and rotate that group 180 degrees about the play-area pivot,
-	# so a coherent copy (backdrop + windows + pillar, relative arrangement intact) lands on the empty
-	# -X side. Client-side, visual-only: just adds static meshes to this client's scene.
+	# Firearm Factory only: the -X side has no wall (FPV shows skybox there). No single flat mesh can be
+	# copied to close it, so BUILD a brick quad with the room's own "brick wall1" texture, sized/placed by
+	# the GUN_WALL_* consts. Client-side, visual-only: just one static mesh added to this client's scene.
 	if _player_class_name != &"ManufactureGunPlayer":
 		return
 	_probe_gun_wall(delta)  # (no-op unless GUN_WALL_PROBE) -- logs the art mesh under the FPV crosshair
@@ -1792,35 +1789,35 @@ func _update_gun_wall(delta: float) -> void:
 	var art := _find_node_named(tree.root, GUN_WALL_ART_ROOT, [SCAN_BUDGET])
 	if art == null or not (art is Node3D):
 		return
-	# Don't build a second copy if one already exists (e.g. after a respawn/lock).
+	# Don't build a second one if it already exists (e.g. after a respawn/lock).
 	var existing := art.get_node_or_null(NodePath(GUN_WALL_CLONE_NAME))
 	if existing is Node3D:
 		_gun_wall_clone = existing as Node3D
 		return
-	# The group's world transform is a 180deg-about-Y reflection through the pivot; each clone parented
-	# under it inherits that reflection while keeping its original relative position (its world transform
-	# becomes the clone's local, because the art root is at identity).
-	var group := Node3D.new()
-	group.name = GUN_WALL_CLONE_NAME
-	art.add_child(group)
-	var rot := Basis(Vector3(-1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, -1))
-	group.global_transform = Transform3D(rot, GUN_WALL_PIVOT - rot * GUN_WALL_PIVOT)
-	var made := 0
-	for nm in GUN_WALL_SOURCE_NAMES:
-		var src := _find_mesh_named(art, String(nm), [SCAN_BUDGET])
-		if src == null:
-			continue
-		var clone := src.duplicate() as MeshInstance3D
-		if clone == null:
-			continue
-		group.add_child(clone)
-		clone.transform = src.global_transform
-		made += 1
-	_gun_wall_clone = group
+	var wall := MeshInstance3D.new()
+	wall.name = GUN_WALL_CLONE_NAME
+	var quad := QuadMesh.new()
+	quad.size = GUN_WALL_SIZE
+	wall.mesh = quad
+	var mat := StandardMaterial3D.new()
+	var tex: Texture2D = load(GUN_WALL_TEXTURE_UID) as Texture2D
+	if tex == null:
+		tex = load(GUN_WALL_TEXTURE_PATH) as Texture2D
+	if tex != null:
+		mat.albedo_texture = tex
+		mat.uv1_scale = GUN_WALL_UV
+	else:
+		mat.albedo_color = Color(0.40, 0.33, 0.29)  # neutral brick-ish fallback if the texture won't load
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from both sides regardless of which way it faces
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS
+	wall.material_override = mat
+	art.add_child(wall)
+	wall.global_transform = Transform3D(Basis(Vector3.UP, GUN_WALL_YAW), GUN_WALL_POS)
+	_gun_wall_clone = wall
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
-		print("[fpv_mod] gun wall: mirrored window wall built (", made, "/",
-			GUN_WALL_SOURCE_NAMES.size(), " meshes) about pivot ", GUN_WALL_PIVOT)
+		print("[fpv_mod] gun wall: built brick wall at ", GUN_WALL_POS, " size ", GUN_WALL_SIZE,
+			" (texture loaded=", tex != null, ")")
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
