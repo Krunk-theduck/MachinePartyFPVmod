@@ -1838,8 +1838,11 @@ func _update_gun_wall(delta: float) -> void:
 		y1 = aabb.end.y
 	var sill := lerpf(y0, y1, 0.30)    # solid brick band below the windows
 	var lintel := lerpf(y0, y1, 0.84)  # solid brick band above the windows
-	var wz0 := lerpf(z0, z1, 0.14)     # window band (solid margins outside it)
-	var wz1 := lerpf(z0, z1, 0.86)
+	# Centre the window band on the room's z-centre (0), not the footprint midpoint -- the wall extends
+	# unevenly to one side, which was pushing the 5 windows off-centre from the opening you look at.
+	var half := minf(0.0 - z0, z1 - 0.0) * 0.80
+	var wz0 := -half
+	var wz1 := half
 	var pillar := (wz1 - wz0) / (float(GUN_WALL_WINDOWS) * 3.5 + 1.0)  # each window is 2.5x a pillar
 	var window := pillar * 2.5
 	var st := SurfaceTool.new()
