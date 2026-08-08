@@ -125,9 +125,7 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
-const GUN_WALL_WINDOWS := 5  # the source's "windows" are a dark overlay, not brick holes, so a copy can't have real openings -- we BUILD a brick wall with this many evenly-spaced window cut-outs and mirror it onto the empty spot
-const GUN_WALL_TEXTURE_UID := "uid://bbopvwko13gmf"  # room "brick wall1"
-const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_brick wall1.png"
+const GUN_WALL_MINX := 2.5  # only copy triangles whose whole footprint is past this local x -- that's the +X wall the player faces, not the side walls (whose bodies run back to low x). We TRANSLATE (not mirror) this copy straight across to the empty -X side, so the real wall lands faithfully -- windows, brick material and all -- with no inversion.
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1812,98 +1810,58 @@ func _update_gun_wall(delta: float) -> void:
 				break
 	if bsurf < 0:
 		return
-	# BUILD a brick wall with GUN_WALL_WINDOWS evenly-spaced window openings, sized to the ACTUAL front
-	# wall's footprint (so it aligns), then mirror onto the empty spot. (The source's "windows" are a
-	# separate dark overlay, not holes in the brick, so a copied brick wall can never have real openings.)
+	# Copy the +X wall the player faces (its real geometry -- windows and all) and TRANSLATE it straight
+	# across to the empty -X side. A translation (not a mirror) keeps the wall faithful: the recessed 5th
+	# window stays recessed instead of inverting into a bulge, and it uses the wall's own brick material.
 	var aabb := shell.get_aabb()
-	var fx := aabb.end.x  # front plane, matching the source wall
-	# Footprint = z/y span of the brick nearest the player (the front wall), so we match it, not the
-	# whole shell (which includes the side walls and would make the panel oversized/misaligned).
+	var dx := aabb.size.x  # shift from the +X wall over to the -X boundary (room width)
 	var arrays := mesh.surface_get_arrays(bsurf)
 	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-	var z0 := INF
-	var z1 := -INF
-	var y0 := INF
-	var y1 := -INF
-	for v in verts:
-		if v.x > fx - 2.5:
-			z0 = minf(z0, v.z)
-			z1 = maxf(z1, v.z)
-			y0 = minf(y0, v.y)
-			y1 = maxf(y1, v.y)
-	if z0 > z1:  # fallback if the front slice was empty
-		z0 = aabb.position.z
-		z1 = aabb.end.z
-		y0 = aabb.position.y
-		y1 = aabb.end.y
-	var sill := lerpf(y0, y1, 0.30)    # solid brick band below the windows
-	var lintel := lerpf(y0, y1, 0.84)  # solid brick band above the windows
-	# Centre the window band on the room's z-centre (0), not the footprint midpoint -- the wall extends
-	# unevenly to one side, which was pushing the 5 windows off-centre from the opening you look at.
-	var half := minf(0.0 - z0, z1 - 0.0) * 0.80
-	var wz0 := -half
-	var wz1 := half
-	var pillar := (wz1 - wz0) / (float(GUN_WALL_WINDOWS) * 3.5 + 1.0)  # each window is 2.5x a pillar
-	var window := pillar * 2.5
+	var norms: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL] if arrays[Mesh.ARRAY_NORMAL] != null else PackedVector3Array()
+	var uvs: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV] if arrays[Mesh.ARRAY_TEX_UV] != null else PackedVector2Array()
+	var idx: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] != null else PackedInt32Array()
+	var have_n := norms.size() == verts.size()
+	var have_uv := uvs.size() == verts.size()
+	var indexed := idx.size() > 0
+	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
-	_gw_quad(st, fx, z0, z1, y0, sill)       # bottom band
-	_gw_quad(st, fx, z0, z1, lintel, y1)     # top band
-	_gw_quad(st, fx, z0, wz0, sill, lintel)  # left margin
-	_gw_quad(st, fx, wz1, z1, sill, lintel)  # right margin
-	var zc := wz0
-	for i in range(GUN_WALL_WINDOWS + 1):    # the pillars between/around the windows
-		_gw_quad(st, fx, zc, zc + pillar, sill, lintel)
-		zc += pillar + window
+	var kept := 0
+	for t in tcount:
+		var i0: int = idx[t * 3] if indexed else t * 3
+		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
+		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
+		# Only the +X wall (whole triangle past the cutoff) -> excludes the side walls, whose bodies run
+		# back to low x. Everything kept is shifted straight across by the room width onto the -X side.
+		if minf(verts[i0].x, minf(verts[i1].x, verts[i2].x)) < GUN_WALL_MINX:
+			continue
+		for ii in [i0, i1, i2]:
+			if have_n:
+				st.set_normal(norms[ii])
+			if have_uv:
+				st.set_uv(uvs[ii])
+			st.add_vertex(Vector3(verts[ii].x - dx, verts[ii].y, verts[ii].z))
+		kept += 1
+	if kept == 0:
+		if not _gun_wall_logged:
+			_gun_wall_logged = true
+			print("[fpv_mod] gun wall: no +X wall triangles matched (cutoff x=", GUN_WALL_MINX, ")")
+		return
 	var wall := MeshInstance3D.new()
 	wall.name = GUN_WALL_CLONE_NAME
 	wall.mesh = st.commit()
-	# Build our own UNSHADED brick material -- the empty -X corner is unlit, so a lit material renders
-	# black there; self-lit shows the brick texture regardless of lighting.
-	var mat := StandardMaterial3D.new()
-	var tex: Texture2D = load(GUN_WALL_TEXTURE_UID) as Texture2D
-	if tex == null:
-		tex = load(GUN_WALL_TEXTURE_PATH) as Texture2D
-	if tex != null:
-		mat.albedo_texture = tex
-		mat.albedo_color = Color(0.62, 0.50, 0.44)  # darker + warmer so the unshaded brick matches the room's lit walls (was washed-out pale)
-	else:
-		mat.albedo_color = Color(0.40, 0.33, 0.29)
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from both sides
-	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS
-	wall.material_override = mat
+	var mat := mesh.surface_get_material(bsurf)  # the wall's own brick material -> correct look/lighting
+	if mat != null:
+		mat = mat.duplicate()
+		if mat is BaseMaterial3D:
+			(mat as BaseMaterial3D).cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from the play-area side
+		wall.material_override = mat
 	art.add_child(wall)
-	# Mirror 180deg about the shell centre: the built wall lands on the shell's open -X boundary.
-	var center: Vector3 = shell.global_transform * shell.get_aabb().get_center()
-	var rot := Basis(Vector3(-1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, -1))
-	var mirror := Transform3D(rot, center - rot * center)
-	wall.global_transform = mirror * shell.global_transform
+	wall.global_transform = shell.global_transform  # no rotation -- the translation is baked into the verts
 	_gun_wall_clone = wall
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
-		print("[fpv_mod] gun wall: built ", GUN_WALL_WINDOWS, "-window wall z[", z0, ",", z1, "] about ", center)
-
-
-func _gw_quad(st: SurfaceTool, x: float, za: float, zb: float, ya: float, yb: float) -> void:
-	# A brick quad in the plane x=const spanning [za,zb] x [ya,yb], facing -X, with planar brick UVs so
-	# the texture tiles continuously across pillars and bands. (The node transform mirrors it to +X-facing.)
-	var uvs := 0.28
-	var p0 := Vector3(x, ya, za)
-	var p1 := Vector3(x, ya, zb)
-	var p2 := Vector3(x, yb, zb)
-	var p3 := Vector3(x, yb, za)
-	var u0 := Vector2(za * uvs, -ya * uvs)
-	var u1 := Vector2(zb * uvs, -ya * uvs)
-	var u2 := Vector2(zb * uvs, -yb * uvs)
-	var u3 := Vector2(za * uvs, -yb * uvs)
-	var nrm := Vector3(-1, 0, 0)
-	st.set_normal(nrm); st.set_uv(u0); st.add_vertex(p0)
-	st.set_normal(nrm); st.set_uv(u1); st.add_vertex(p1)
-	st.set_normal(nrm); st.set_uv(u2); st.add_vertex(p2)
-	st.set_normal(nrm); st.set_uv(u0); st.add_vertex(p0)
-	st.set_normal(nrm); st.set_uv(u2); st.add_vertex(p2)
-	st.set_normal(nrm); st.set_uv(u3); st.add_vertex(p3)
+		print("[fpv_mod] gun wall: copied ", kept, " front-wall tris, shifted by ", dx, " onto the -X side")
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
