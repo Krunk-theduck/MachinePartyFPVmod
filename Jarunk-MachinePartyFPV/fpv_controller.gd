@@ -117,20 +117,17 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 # Firearm Factory: the big inward-facing "fog_catcher" box (a direct child of the minigame) has no
 # material, so it renders solid white -- invisible to the framed 3rd-person cam but a blank wall in
 # FPV. Retexture it with the room's own "metal seawall" wall texture.
-# Firearm Factory's -X side is open (no wall -> skybox in FPV). There is no single flat "middle wall"
-# mesh to copy (the real walls are a big bulky backdrop + a play-area shell + segmented pieces), so we
-# BUILD a brick wall to close the opening, using the room's own "brick wall1" texture, sized to the room.
-# Position/size/uv are tunable below. Client-side, FPV-only (removed when FPV is off).
-const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"  # parent that holds the room's wall meshes
-const GUN_WALL_CLONE_NAME := "fpv_added_wall"  # the wall node we add; also the dedupe key
-const GUN_WALL_POS := Vector3(-9.0, 4.5, -0.6)  # centre of the wall that closes the open -X side
-const GUN_WALL_SIZE := Vector2(26.0, 13.0)  # quad size: width (along Z) x height (along Y)
-const GUN_WALL_YAW := 1.5707963  # +90deg about Y -> quad faces +X, toward the play area
-const GUN_WALL_TEXTURE_UID := "uid://bbopvwko13gmf"  # room "brick wall1"
-const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_brick wall1.png"
-const GUN_WALL_UV := Vector3(6.0, 3.0, 1.0)  # brick tiling across the quad
-const GUN_WALL_ENABLED := false  # diagnostic build: constructed wall off while we ID the real wall mesh
-const GUN_WALL_PROBE := true  # log the two nearest art meshes under the FPV crosshair (backdrop excluded)
+# Firearm Factory's -X side is open (no wall -> skybox in FPV). Source review: the ONLY mesh using the
+# room's "brick wall1" texture is `blockout mesh` (the play-area shell); its brick surface IS the walls
+# the player sees, window openings and all. We lift just that surface's +X-facing wall triangles (the
+# openings are gaps in the mesh, so they come along) and mirror them 180deg about the shell centre onto
+# the open -X side. Exact same brick + real windows, no clutter. Client-side, FPV-only.
+const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
+const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
+const GUN_WALL_CLONE_NAME := "fpv_added_wall"
+const GUN_WALL_FRONT_X := 3.0  # shell-local x cutoff: X-facing triangles past this = the +X (middle) wall
+const GUN_WALL_ENABLED := true
+const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -1773,12 +1770,12 @@ func _find_mesh_named(n: Node, mesh_name: String, budget: Array) -> MeshInstance
 
 
 func _update_gun_wall(delta: float) -> void:
-	# Firearm Factory only: the -X side has no wall (FPV shows skybox there). No single flat mesh can be
-	# copied to close it, so BUILD a brick quad with the room's own "brick wall1" texture, sized/placed by
-	# the GUN_WALL_* consts. Client-side, visual-only: just one static mesh added to this client's scene.
+	# Firearm Factory only: close the open -X side. Lift the +X-facing wall triangles out of the shell's
+	# brick surface (window openings are gaps in the geometry, so they come along) and mirror them 180deg
+	# about the shell centre onto the -X gap. Exact brick + real windows, no clutter. Visual-only.
 	if _player_class_name != &"ManufactureGunPlayer":
 		return
-	_probe_gun_wall(delta)  # (no-op unless GUN_WALL_PROBE) -- logs the art mesh under the FPV crosshair
+	_probe_gun_wall(delta)  # (no-op unless GUN_WALL_PROBE)
 	if not GUN_WALL_ENABLED:
 		return
 	if _gun_wall_clone != null and is_instance_valid(_gun_wall_clone):
@@ -1789,35 +1786,87 @@ func _update_gun_wall(delta: float) -> void:
 	var art := _find_node_named(tree.root, GUN_WALL_ART_ROOT, [SCAN_BUDGET])
 	if art == null or not (art is Node3D):
 		return
-	# Don't build a second one if it already exists (e.g. after a respawn/lock).
 	var existing := art.get_node_or_null(NodePath(GUN_WALL_CLONE_NAME))
 	if existing is Node3D:
 		_gun_wall_clone = existing as Node3D
 		return
+	var shell := _find_mesh_named(art, GUN_WALL_SHELL_MESH, [SCAN_BUDGET])
+	if shell == null or shell.mesh == null:
+		if not _gun_wall_logged:
+			_gun_wall_logged = true
+			print("[fpv_mod] gun wall: shell '", GUN_WALL_SHELL_MESH, "' not found yet")
+		return
+	var mesh := shell.mesh as ArrayMesh
+	if mesh == null:
+		return
+	# The brick-wall surface is the one whose material uses a texture named "brick".
+	var bsurf := -1
+	for s in mesh.get_surface_count():
+		var sm := mesh.surface_get_material(s)
+		if sm is BaseMaterial3D:
+			var tx := (sm as BaseMaterial3D).albedo_texture
+			if tx != null and String(tx.resource_path).to_lower().find("brick") >= 0:
+				bsurf = s
+				break
+	if bsurf < 0:
+		return
+	var arrays := mesh.surface_get_arrays(bsurf)
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var norms: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL] if arrays[Mesh.ARRAY_NORMAL] != null else PackedVector3Array()
+	var uvs: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV] if arrays[Mesh.ARRAY_TEX_UV] != null else PackedVector2Array()
+	var idx: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] != null else PackedInt32Array()
+	var have_n := norms.size() == verts.size()
+	var have_uv := uvs.size() == verts.size()
+	var indexed := idx.size() > 0
+	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var kept := 0
+	for t in tcount:
+		var i0: int = idx[t * 3] if indexed else t * 3
+		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
+		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
+		var v0 := verts[i0]
+		var v1 := verts[i1]
+		var v2 := verts[i2]
+		var nrm := (v1 - v0).cross(v2 - v0)
+		if nrm.length() < 0.0000001:
+			continue
+		nrm = nrm.normalized()
+		# keep only the +X-facing wall (X-ish normal, on the +X side of the shell)
+		if absf(nrm.x) < 0.6 or (v0.x + v1.x + v2.x) / 3.0 < GUN_WALL_FRONT_X:
+			continue
+		for ii in [i0, i1, i2]:
+			if have_n:
+				st.set_normal(norms[ii])
+			if have_uv:
+				st.set_uv(uvs[ii])
+			st.add_vertex(verts[ii])
+		kept += 1
+	if kept == 0:
+		if not _gun_wall_logged:
+			_gun_wall_logged = true
+			print("[fpv_mod] gun wall: no +X wall triangles matched in shell brick surface")
+		return
 	var wall := MeshInstance3D.new()
 	wall.name = GUN_WALL_CLONE_NAME
-	var quad := QuadMesh.new()
-	quad.size = GUN_WALL_SIZE
-	wall.mesh = quad
-	var mat := StandardMaterial3D.new()
-	var tex: Texture2D = load(GUN_WALL_TEXTURE_UID) as Texture2D
-	if tex == null:
-		tex = load(GUN_WALL_TEXTURE_PATH) as Texture2D
-	if tex != null:
-		mat.albedo_texture = tex
-		mat.uv1_scale = GUN_WALL_UV
-	else:
-		mat.albedo_color = Color(0.40, 0.33, 0.29)  # neutral brick-ish fallback if the texture won't load
-	mat.cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from both sides regardless of which way it faces
-	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS
-	wall.material_override = mat
+	wall.mesh = st.commit()
+	var mat := mesh.surface_get_material(bsurf)
+	if mat != null:
+		mat = mat.duplicate()
+		if mat is BaseMaterial3D:
+			(mat as BaseMaterial3D).cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from both sides
+		wall.material_override = mat
 	art.add_child(wall)
-	wall.global_transform = Transform3D(Basis(Vector3.UP, GUN_WALL_YAW), GUN_WALL_POS)
+	# Mirror 180deg about the shell centre: the +X wall lands exactly on the shell's open -X boundary.
+	var center: Vector3 = shell.global_transform * shell.get_aabb().get_center()
+	var rot := Basis(Vector3(-1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, -1))
+	var mirror := Transform3D(rot, center - rot * center)
+	wall.global_transform = mirror * shell.global_transform
 	_gun_wall_clone = wall
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
-		print("[fpv_mod] gun wall: built brick wall at ", GUN_WALL_POS, " size ", GUN_WALL_SIZE,
-			" (texture loaded=", tex != null, ")")
+		print("[fpv_mod] gun wall: mirrored ", kept, " +X wall tris from shell about ", center)
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
