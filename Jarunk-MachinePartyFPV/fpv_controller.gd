@@ -126,8 +126,7 @@ const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
 const GUN_WALL_MINX := 2.5  # only copy triangles whose whole footprint is past this local x -- that's the +X wall the player faces, not the side walls (whose bodies run back to low x). We TRANSLATE (not mirror) this copy straight across to the empty -X side, so the real wall lands faithfully -- windows, brick material and all -- with no inversion.
-const GUN_WALL_CLOSER := 1.6  # shift the copied wall this much toward the play area (+x); the front face sits here
-const GUN_WALL_THICKNESS := 0.8  # extrude the flattened panel this far BACKWARD (−x, away from player) so it's solid, not paper-thin, while the front stays flush
+const GUN_WALL_CLOSER := 1.6  # shift the copied wall this much toward the play area (+x)
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1820,10 +1819,7 @@ func _update_gun_wall(delta: float) -> void:
 	# across to the empty -X side. A translation (not a mirror) keeps the wall faithful: the recessed 5th
 	# window stays recessed instead of inverting into a bulge, and it uses the wall's own brick material.
 	var aabb := shell.get_aabb()
-	# Flatten every copied vertex onto this single x-plane (the translated front face) so the window
-	# frames/reveals don't stick out toward the player -- the openings become flush cut-outs. This plane
-	# equals the original front (aabb.end.x) shifted across by the room width, plus the CLOSER nudge.
-	var flat_x := aabb.position.x + GUN_WALL_CLOSER
+	var dx := aabb.size.x  # shift from the +X wall over to the -X boundary (room width)
 	var arrays := mesh.surface_get_arrays(bsurf)
 	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
 	var norms: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL] if arrays[Mesh.ARRAY_NORMAL] != null else PackedVector3Array()
@@ -1835,37 +1831,22 @@ func _update_gun_wall(delta: float) -> void:
 	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
-	var back_x := flat_x - GUN_WALL_THICKNESS
-	var ecount := {}  # edge (y,z pair) -> how many kept tris use it; ==1 means a boundary edge
-	var epts := {}    # edge key -> [Vector3 a, Vector3 b, Vector2 uv_a, Vector2 uv_b]
 	var kept := 0
 	for t in tcount:
 		var i0: int = idx[t * 3] if indexed else t * 3
 		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
-		# Only the +X wall (whole triangle past the cutoff) -> excludes the side walls, whose bodies run
-		# back to low x. The kept front panel is flattened to flat_x, then extruded back to back_x.
+		# Only the +X wall the player faces (whole triangle past the cutoff); side walls run to low x.
+		# Copied at FULL depth (real thickness) and shifted straight across onto the -X side.
 		if minf(verts[i0].x, minf(verts[i1].x, verts[i2].x)) < GUN_WALL_MINX:
 			continue
-		var a := verts[i0]
-		var b := verts[i1]
-		var c := verts[i2]
-		var ua: Vector2 = uvs[i0] if have_uv else Vector2.ZERO
-		var ub: Vector2 = uvs[i1] if have_uv else Vector2.ZERO
-		var uc: Vector2 = uvs[i2] if have_uv else Vector2.ZERO
-		_gw_face(st, flat_x, a, b, c, ua, ub, uc, false)  # front face (flush)
-		_gw_face(st, back_x, a, c, b, ua, uc, ub, true)    # back face (reversed winding)
-		# tally the 3 edges so we can find the boundary (outer edge + each window's perimeter)
-		_gw_edge(ecount, epts, a, b, ua, ub)
-		_gw_edge(ecount, epts, b, c, ub, uc)
-		_gw_edge(ecount, epts, c, a, uc, ua)
+		for ii in [i0, i1, i2]:
+			if have_n:
+				st.set_normal(norms[ii])
+			if have_uv:
+				st.set_uv(uvs[ii])
+			st.add_vertex(Vector3(verts[ii].x - dx + GUN_WALL_CLOSER, verts[ii].y, verts[ii].z))
 		kept += 1
-	# Connect front to back along every BOUNDARY edge -> the outer sides + the window reveals, so it's
-	# one solid wall instead of two loose sheets.
-	for key in ecount:
-		if ecount[key] == 1:
-			var e: Array = epts[key]
-			_gw_side(st, flat_x, back_x, e[0], e[1], e[2], e[3])
 	if kept == 0:
 		if not _gun_wall_logged:
 			_gun_wall_logged = true
@@ -1881,56 +1862,16 @@ func _update_gun_wall(delta: float) -> void:
 			(mat as BaseMaterial3D).cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from the play-area side
 		wall.material_override = mat
 	art.add_child(wall)
-	wall.global_transform = shell.global_transform  # no rotation -- the translation is baked into the verts
+	wall.global_transform = shell.global_transform
+	# Reflect the copy in X about its own centre so its full thickness (and the window reveals) extends
+	# AWAY from the player -- keeps the real wall depth but stops the frames poking toward you.
+	var wc: Vector3 = wall.global_transform * wall.get_aabb().get_center()
+	var flipx := Basis(Vector3(-1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, 1))
+	wall.global_transform = Transform3D(flipx, wc - flipx * wc) * wall.global_transform
 	_gun_wall_clone = wall
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
-		print("[fpv_mod] gun wall: copied ", kept, " front-wall tris, flattened onto x=", flat_x, " (-X side)")
-
-
-func _gw_face(st: SurfaceTool, x: float, a: Vector3, b: Vector3, c: Vector3, ua: Vector2, ub: Vector2, uc: Vector2, back: bool) -> void:
-	# One triangle of the wall panel, in the plane x=const, using a/b/c's y,z. `back` faces the other way.
-	var nrm: Vector3 = Vector3(1, 0, 0) if back else Vector3(-1, 0, 0)
-	st.set_normal(nrm); st.set_uv(ua); st.add_vertex(Vector3(x, a.y, a.z))
-	st.set_normal(nrm); st.set_uv(ub); st.add_vertex(Vector3(x, b.y, b.z))
-	st.set_normal(nrm); st.set_uv(uc); st.add_vertex(Vector3(x, c.y, c.z))
-
-
-func _gw_ekey(a: Vector3, b: Vector3) -> String:
-	# Order-independent key for an edge, from its two (y,z) endpoints quantised to 1/16 unit.
-	var ay := roundi(a.y * 16.0)
-	var az := roundi(a.z * 16.0)
-	var by := roundi(b.y * 16.0)
-	var bz := roundi(b.z * 16.0)
-	if ay < by or (ay == by and az <= bz):
-		return "%d_%d_%d_%d" % [ay, az, by, bz]
-	return "%d_%d_%d_%d" % [by, bz, ay, az]
-
-
-func _gw_edge(ecount: Dictionary, epts: Dictionary, a: Vector3, b: Vector3, ua: Vector2, ub: Vector2) -> void:
-	var key := _gw_ekey(a, b)
-	if ecount.has(key):
-		ecount[key] += 1
-	else:
-		ecount[key] = 1
-		epts[key] = [a, b, ua, ub]
-
-
-func _gw_side(st: SurfaceTool, xf: float, xb: float, a: Vector3, b: Vector3, ua: Vector2, ub: Vector2) -> void:
-	# A quad bridging front plane (xf) to back plane (xb) along edge a-b -> a window reveal / outer side.
-	var fa := Vector3(xf, a.y, a.z)
-	var fb := Vector3(xf, b.y, b.z)
-	var ba := Vector3(xb, a.y, a.z)
-	var bb := Vector3(xb, b.y, b.z)
-	var nrm := (fb - fa).cross(Vector3(1, 0, 0)).normalized()
-	if nrm.length() < 0.001:
-		nrm = Vector3(0, 1, 0)
-	st.set_normal(nrm); st.set_uv(ua); st.add_vertex(fa)
-	st.set_normal(nrm); st.set_uv(ub); st.add_vertex(fb)
-	st.set_normal(nrm); st.set_uv(ub); st.add_vertex(bb)
-	st.set_normal(nrm); st.set_uv(ua); st.add_vertex(fa)
-	st.set_normal(nrm); st.set_uv(ub); st.add_vertex(bb)
-	st.set_normal(nrm); st.set_uv(ua); st.add_vertex(ba)
+		print("[fpv_mod] gun wall: copied ", kept, " front-wall tris (full depth, x-reflected) onto the -X side")
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
