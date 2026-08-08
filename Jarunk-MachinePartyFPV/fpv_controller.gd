@@ -126,6 +126,11 @@ const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"  # parent that holds 
 # windowed "middle" wall; reorder/extend if a different mesh turns out to be the one with the windows.
 const GUN_WALL_SOURCE_NAMES := ["background main wall", "blockout mesh", "background wall"]
 const GUN_WALL_CLONE_NAME := "fpv_mirrored_window_wall"  # our added copy; also used to avoid duplicating it
+# The room's wall meshes are decomposed oddly (a giant backdrop shell + segmented walls), so the source
+# name can't be picked blindly. PROBE logs the art mesh under the FPV crosshair so we can name the real
+# window wall; ENABLED stays off until that name is confirmed, so no wrong wall gets spawned meanwhile.
+const GUN_WALL_ENABLED := false
+const GUN_WALL_PROBE := true
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -204,6 +209,8 @@ var _smoke_timer_source: Node = null # the minigame's own timer label we mirror 
 var _round_timer_green: bool = false  # true = Forklift (green digits/bezel), false = Smoke Break (red)
 var _gun_wall_clone: MeshInstance3D = null  # our duplicated window wall, placed on the empty opposite side
 var _gun_wall_logged: bool = false  # one-shot diagnostic if we can't find a source wall to duplicate
+var _gun_probe_last: String = ""  # last art-mesh name the crosshair probe reported (log only on change)
+var _gun_probe_accum: float = 0.0  # throttle timer for the crosshair probe
 
 var _debris_grab_collision: CollisionShape3D = null
 var _debris_grab_original_shape: Shape3D = null
@@ -1587,6 +1594,10 @@ func _process(delta: float) -> void:
 		return
 
 	if not enabled:
+		# FPV off -> don't leave the FPV-only gun wall sitting in a 3rd-person game.
+		if _gun_wall_clone != null and is_instance_valid(_gun_wall_clone):
+			_gun_wall_clone.queue_free()
+		_gun_wall_clone = null
 		return
 
 	_accum += delta
@@ -1741,7 +1752,9 @@ func _render_head_cam(delta: float, active: bool) -> void:
 		_update_collar_indicator()
 		_update_smoke_break_hud()
 		_update_round_timer()
-		_update_gun_wall()
+	# Gun-game wall: OUTSIDE the active gate so it also appears before/during the countdown. It only
+	# runs here on the FPV render path, so it can't show when FPV is toggled off (see _process).
+	_update_gun_wall(delta)
 
 	_set_fpv_camera_active(true)
 
@@ -1759,7 +1772,7 @@ func _find_mesh_named(n: Node, mesh_name: String, budget: Array) -> MeshInstance
 	return null
 
 
-func _update_gun_wall() -> void:
+func _update_gun_wall(delta: float) -> void:
 	# Firearm Factory only: the room is missing its 4th wall (open side -> you see the skybox in FPV).
 	# Duplicate the existing windowed "middle" wall and place the copy on the empty opposite side by
 	# rotating it 180 degrees around the room's vertical centre axis. A real rotation (not a mirror /
@@ -1767,6 +1780,9 @@ func _update_gun_wall() -> void:
 	# Client-side and visual-only: it just adds a static wall to this client's scene.
 	if _player_class_name != &"ManufactureGunPlayer":
 		return
+	_probe_gun_wall(delta)  # identify the real window wall by looking at it (logs the mesh under the crosshair)
+	if not GUN_WALL_ENABLED:
+		return  # auto-clone held off until the correct window-wall node is confirmed via the probe
 	if _gun_wall_clone != null and is_instance_valid(_gun_wall_clone):
 		return
 	var tree := get_tree()
@@ -1824,6 +1840,54 @@ func _art_group_center(art: Node3D) -> Vector3:
 	if not have:
 		return art.global_transform.origin
 	return acc.get_center()
+
+
+func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
+	if budget[0] <= 0:
+		return
+	budget[0] -= 1
+	if n is MeshInstance3D:
+		out.append(n)
+	for ch in n.get_children():
+		_collect_meshes(ch, out, budget)
+
+
+func _probe_gun_wall(delta: float) -> void:
+	# Diagnostic: cast a ray straight out of the FPV camera and log the nearest art mesh it hits, so we
+	# can learn the exact node name of the window wall the player is looking at (the debug overlay never
+	# labels static walls). Throttled, and only logs when the target changes. Remove once identified.
+	if not GUN_WALL_PROBE:
+		return
+	_gun_probe_accum += delta
+	if _gun_probe_accum < 0.35:
+		return
+	_gun_probe_accum = 0.0
+	var tree := get_tree()
+	if tree == null or _camera == null or not is_instance_valid(_camera) or _camera.get_parent() == null:
+		return
+	var art := _find_node_named(tree.root, GUN_WALL_ART_ROOT, [SCAN_BUDGET])
+	if art == null:
+		return
+	var from: Vector3 = _camera.global_position
+	var dir: Vector3 = -_camera.global_transform.basis.z  # camera forward
+	var meshes: Array = []
+	_collect_meshes(art, meshes, [SCAN_BUDGET])
+	var best_name := ""
+	var best_dist := 1.0e20
+	for m in meshes:
+		var mi := m as MeshInstance3D
+		if mi == _gun_wall_clone:
+			continue
+		var world_aabb: AABB = mi.global_transform * mi.get_aabb()
+		var hit = world_aabb.intersects_ray(from, dir)
+		if hit != null:
+			var d: float = from.distance_to(hit)
+			if d < best_dist:
+				best_dist = d
+				best_name = String(mi.name)
+	if best_name != "" and best_name != _gun_probe_last:
+		_gun_probe_last = best_name
+		print("[fpv_mod] gun probe: crosshair on '", best_name, "'  (", int(best_dist), "m)")
 
 
 func _class_from_skeleton_owner() -> StringName:
