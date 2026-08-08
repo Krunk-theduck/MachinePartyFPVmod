@@ -126,6 +126,8 @@ const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
 const GUN_WALL_WINDOWS := 5  # the source's "windows" are a dark overlay, not brick holes, so a copy can't have real openings -- we BUILD a brick wall with this many evenly-spaced window cut-outs and mirror it onto the empty spot
+const GUN_WALL_TEXTURE_UID := "uid://bbopvwko13gmf"  # room "brick wall1"
+const GUN_WALL_TEXTURE_PATH := "res://minigames/manufacture_gun/models/manufacture gun artwork pass2/manufacture gun artwork pass2_brick wall1.png"
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1810,15 +1812,30 @@ func _update_gun_wall(delta: float) -> void:
 				break
 	if bsurf < 0:
 		return
-	# BUILD a brick wall with GUN_WALL_WINDOWS evenly-spaced window openings, spanning the source wall's
-	# footprint, then mirror it onto the empty spot. (The source's "windows" are a separate dark overlay,
-	# not holes in the brick, so a copied brick wall can never have real openings -- we cut our own.)
+	# BUILD a brick wall with GUN_WALL_WINDOWS evenly-spaced window openings, sized to the ACTUAL front
+	# wall's footprint (so it aligns), then mirror onto the empty spot. (The source's "windows" are a
+	# separate dark overlay, not holes in the brick, so a copied brick wall can never have real openings.)
 	var aabb := shell.get_aabb()
-	var fx := aabb.position.x + aabb.size.x  # front plane, matching the source wall
-	var z0 := aabb.position.z
-	var z1 := aabb.end.z
-	var y0 := aabb.position.y
-	var y1 := aabb.end.y
+	var fx := aabb.end.x  # front plane, matching the source wall
+	# Footprint = z/y span of the brick nearest the player (the front wall), so we match it, not the
+	# whole shell (which includes the side walls and would make the panel oversized/misaligned).
+	var arrays := mesh.surface_get_arrays(bsurf)
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var z0 := INF
+	var z1 := -INF
+	var y0 := INF
+	var y1 := -INF
+	for v in verts:
+		if v.x > fx - 2.5:
+			z0 = minf(z0, v.z)
+			z1 = maxf(z1, v.z)
+			y0 = minf(y0, v.y)
+			y1 = maxf(y1, v.y)
+	if z0 > z1:  # fallback if the front slice was empty
+		z0 = aabb.position.z
+		z1 = aabb.end.z
+		y0 = aabb.position.y
+		y1 = aabb.end.y
 	var sill := lerpf(y0, y1, 0.30)    # solid brick band below the windows
 	var lintel := lerpf(y0, y1, 0.84)  # solid brick band above the windows
 	var wz0 := lerpf(z0, z1, 0.14)     # window band (solid margins outside it)
@@ -1838,12 +1855,21 @@ func _update_gun_wall(delta: float) -> void:
 	var wall := MeshInstance3D.new()
 	wall.name = GUN_WALL_CLONE_NAME
 	wall.mesh = st.commit()
-	var mat := mesh.surface_get_material(bsurf)
-	if mat != null:
-		mat = mat.duplicate()
-		if mat is BaseMaterial3D:
-			(mat as BaseMaterial3D).cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from both sides
-		wall.material_override = mat
+	# Build our own UNSHADED brick material -- the empty -X corner is unlit, so a lit material renders
+	# black there; self-lit shows the brick texture regardless of lighting.
+	var mat := StandardMaterial3D.new()
+	var tex: Texture2D = load(GUN_WALL_TEXTURE_UID) as Texture2D
+	if tex == null:
+		tex = load(GUN_WALL_TEXTURE_PATH) as Texture2D
+	if tex != null:
+		mat.albedo_texture = tex
+		mat.albedo_color = Color(0.82, 0.79, 0.75)  # tone the unshaded texture down so it doesn't blow out
+	else:
+		mat.albedo_color = Color(0.40, 0.33, 0.29)
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from both sides
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS
+	wall.material_override = mat
 	art.add_child(wall)
 	# Mirror 180deg about the shell centre: the built wall lands on the shell's open -X boundary.
 	var center: Vector3 = shell.global_transform * shell.get_aabb().get_center()
