@@ -126,6 +126,7 @@ const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
 const GUN_WALL_MINX := 2.5  # only copy triangles whose whole footprint is past this local x -- that's the +X wall the player faces, not the side walls (whose bodies run back to low x). We TRANSLATE (not mirror) this copy straight across to the empty -X side, so the real wall lands faithfully -- windows, brick material and all -- with no inversion.
+const GUN_WALL_DROP := 0.6  # nudge the copied wall down this much so it sits closer to the floor (closes the small gap under it)
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1840,7 +1841,7 @@ func _update_gun_wall(delta: float) -> void:
 				st.set_normal(norms[ii])
 			if have_uv:
 				st.set_uv(uvs[ii])
-			st.add_vertex(Vector3(verts[ii].x - dx, verts[ii].y, verts[ii].z))
+			st.add_vertex(Vector3(verts[ii].x - dx, verts[ii].y - GUN_WALL_DROP, verts[ii].z))
 		kept += 1
 	if kept == 0:
 		if not _gun_wall_logged:
