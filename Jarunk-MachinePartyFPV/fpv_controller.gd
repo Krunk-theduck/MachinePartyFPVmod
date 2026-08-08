@@ -125,8 +125,7 @@ const SECRET_LEVEL_FLOOR_UV_SCALE := 24.0
 const GUN_WALL_ART_ROOT := "manufacture gun artwork pass2"
 const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the actual walls + windows
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
-const GUN_WALL_FACE_DOT := 0.55  # only take wall faces (|normal.x| >= this) -> the facing wall panel, not the side walls (face Z) or floor (face Y)
-const GUN_WALL_MINX := 2.0  # only faces past this local x (the +X wall region); flattening pulls the set-back 5th-window section onto the wall plane so all 5 sit flush
+const GUN_WALL_WINDOWS := 5  # the source's "windows" are a dark overlay, not brick holes, so a copy can't have real openings -- we BUILD a brick wall with this many evenly-spaced window cut-outs and mirror it onto the empty spot
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1811,53 +1810,31 @@ func _update_gun_wall(delta: float) -> void:
 				break
 	if bsurf < 0:
 		return
-	var arrays := mesh.surface_get_arrays(bsurf)
-	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-	var norms: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL] if arrays[Mesh.ARRAY_NORMAL] != null else PackedVector3Array()
-	var uvs: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV] if arrays[Mesh.ARRAY_TEX_UV] != null else PackedVector2Array()
-	var idx: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] != null else PackedInt32Array()
-	var have_n := norms.size() == verts.size()
-	var have_uv := uvs.size() == verts.size()
-	var indexed := idx.size() > 0
-	var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
-	# The wall is curved and baked into one mesh with the side walls, so no clean per-triangle cut works.
-	# Mirror the whole brick surface across the room, but only KEEP triangles whose mirror lands in the
-	# empty spot (within GUN_WALL_SPOT_DEPTH of the far boundary). Everything else is dropped, so the rest
-	# of the map is left untouched -- no duplicated walls. The facing wall mirrors into the empty spot.
+	# BUILD a brick wall with GUN_WALL_WINDOWS evenly-spaced window openings, spanning the source wall's
+	# footprint, then mirror it onto the empty spot. (The source's "windows" are a separate dark overlay,
+	# not holes in the brick, so a copied brick wall can never have real openings -- we cut our own.)
 	var aabb := shell.get_aabb()
-	var front_x := aabb.position.x + aabb.size.x  # the wall's front plane; every face gets flattened here
+	var fx := aabb.position.x + aabb.size.x  # front plane, matching the source wall
+	var z0 := aabb.position.z
+	var z1 := aabb.end.z
+	var y0 := aabb.position.y
+	var y1 := aabb.end.y
+	var sill := lerpf(y0, y1, 0.30)    # solid brick band below the windows
+	var lintel := lerpf(y0, y1, 0.84)  # solid brick band above the windows
+	var wz0 := lerpf(z0, z1, 0.14)     # window band (solid margins outside it)
+	var wz1 := lerpf(z0, z1, 0.86)
+	var pillar := (wz1 - wz0) / (float(GUN_WALL_WINDOWS) * 3.5 + 1.0)  # each window is 2.5x a pillar
+	var window := pillar * 2.5
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
-	var kept := 0
-	for t in tcount:
-		var i0: int = idx[t * 3] if indexed else t * 3
-		var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
-		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
-		var v0 := verts[i0]
-		var v1 := verts[i1]
-		var v2 := verts[i2]
-		var nrm := (v1 - v0).cross(v2 - v0)
-		if nrm.length() < 0.0000001:
-			continue
-		# Only the facing wall panel (perpendicular to X) in the +X region -- excludes side walls (face Z)
-		# and floor (face Y). Flatten every vertex onto the front plane so the set-back 5th-window section
-		# lies flush with the other four; the node transform then mirrors the flat panel onto the gap.
-		if absf(nrm.normalized().x) < GUN_WALL_FACE_DOT:
-			continue
-		if minf(v0.x, minf(v1.x, v2.x)) < GUN_WALL_MINX:
-			continue
-		for ii in [i0, i1, i2]:
-			if have_n:
-				st.set_normal(norms[ii])
-			if have_uv:
-				st.set_uv(uvs[ii])
-			st.add_vertex(Vector3(front_x, verts[ii].y, verts[ii].z))
-		kept += 1
-	if kept == 0:
-		if not _gun_wall_logged:
-			_gun_wall_logged = true
-			print("[fpv_mod] gun wall: no +X wall triangles matched in shell brick surface")
-		return
+	_gw_quad(st, fx, z0, z1, y0, sill)       # bottom band
+	_gw_quad(st, fx, z0, z1, lintel, y1)     # top band
+	_gw_quad(st, fx, z0, wz0, sill, lintel)  # left margin
+	_gw_quad(st, fx, wz1, z1, sill, lintel)  # right margin
+	var zc := wz0
+	for i in range(GUN_WALL_WINDOWS + 1):    # the pillars between/around the windows
+		_gw_quad(st, fx, zc, zc + pillar, sill, lintel)
+		zc += pillar + window
 	var wall := MeshInstance3D.new()
 	wall.name = GUN_WALL_CLONE_NAME
 	wall.mesh = st.commit()
@@ -1868,7 +1845,7 @@ func _update_gun_wall(delta: float) -> void:
 			(mat as BaseMaterial3D).cull_mode = BaseMaterial3D.CULL_DISABLED  # visible from both sides
 		wall.material_override = mat
 	art.add_child(wall)
-	# Mirror 180deg about the shell centre: the +X wall lands exactly on the shell's open -X boundary.
+	# Mirror 180deg about the shell centre: the built wall lands on the shell's open -X boundary.
 	var center: Vector3 = shell.global_transform * shell.get_aabb().get_center()
 	var rot := Basis(Vector3(-1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, -1))
 	var mirror := Transform3D(rot, center - rot * center)
@@ -1876,7 +1853,28 @@ func _update_gun_wall(delta: float) -> void:
 	_gun_wall_clone = wall
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
-		print("[fpv_mod] gun wall: mirrored ", kept, " +X wall tris from shell about ", center)
+		print("[fpv_mod] gun wall: built ", GUN_WALL_WINDOWS, "-window wall z[", z0, ",", z1, "] about ", center)
+
+
+func _gw_quad(st: SurfaceTool, x: float, za: float, zb: float, ya: float, yb: float) -> void:
+	# A brick quad in the plane x=const spanning [za,zb] x [ya,yb], facing -X, with planar brick UVs so
+	# the texture tiles continuously across pillars and bands. (The node transform mirrors it to +X-facing.)
+	var uvs := 0.28
+	var p0 := Vector3(x, ya, za)
+	var p1 := Vector3(x, ya, zb)
+	var p2 := Vector3(x, yb, zb)
+	var p3 := Vector3(x, yb, za)
+	var u0 := Vector2(za * uvs, -ya * uvs)
+	var u1 := Vector2(zb * uvs, -ya * uvs)
+	var u2 := Vector2(zb * uvs, -yb * uvs)
+	var u3 := Vector2(za * uvs, -yb * uvs)
+	var nrm := Vector3(-1, 0, 0)
+	st.set_normal(nrm); st.set_uv(u0); st.add_vertex(p0)
+	st.set_normal(nrm); st.set_uv(u1); st.add_vertex(p1)
+	st.set_normal(nrm); st.set_uv(u2); st.add_vertex(p2)
+	st.set_normal(nrm); st.set_uv(u0); st.add_vertex(p0)
+	st.set_normal(nrm); st.set_uv(u2); st.add_vertex(p2)
+	st.set_normal(nrm); st.set_uv(u3); st.add_vertex(p3)
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
