@@ -127,7 +127,7 @@ const GUN_WALL_SHELL_MESH := "blockout mesh"  # its brick-wall surface holds the
 const GUN_WALL_CLONE_NAME := "fpv_added_wall"
 const GUN_WALL_MINX := 2.5  # only copy triangles whose whole footprint is past this local x -- that's the +X wall the player faces, not the side walls (whose bodies run back to low x). We TRANSLATE (not mirror) this copy straight across to the empty -X side, so the real wall lands faithfully -- windows, brick material and all -- with no inversion.
 const GUN_WALL_CLOSER := 1.6  # shift the copied wall this much toward the play area (+x)
-const GUN_WALL_ZINSET := 0.6  # trim this much off each side (z) edge so the new wall stops short of the corners and doesn't z-fight/overlap the adjacent side walls (which sit right behind, so no gap shows)
+const GUN_WALL_ZINSET := 0.8  # CUT this much off each z END of the wall so its ends stop short of the corners and don't overlap the adjacent side walls (which back it, so no gap shows). Pure z-cut -- does NOT move the wall.
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
@@ -1848,11 +1848,10 @@ func _update_gun_wall(delta: float) -> void:
 			minz = minf(minz, verts[jj].z)
 			maxz = maxf(maxz, verts[jj].z)
 	var cx := (minx + maxx) * 0.5
-	# Pull both z-edges in by GUN_WALL_ZINSET (scale toward the z-centre) so the wall stops short of the
-	# corners -- symmetric, no dropped triangles, and its bottom edge still meets the floor.
-	var zc := (minz + maxz) * 0.5
-	var zw := maxz - minz
-	var zscale: float = (zw - 2.0 * GUN_WALL_ZINSET) / zw if zw > 0.001 else 1.0
+	# Cut off everything past these two z planes -> the wall's end sections (which reach the corners and
+	# overlap the side walls). Pure cut: it does NOT move or scale the rest of the wall.
+	var zlo := minz + GUN_WALL_ZINSET
+	var zhi := maxz - GUN_WALL_ZINSET
 	# Second pass: copy the wall at full depth, reflected about cx so the thickness/reveals face AWAY
 	# from the player. The reflection is baked into the verts (reversed winding + x-flipped normals) so
 	# the face normals stay correct -- that lets the wall's OWN lit brick material light it exactly like
@@ -1866,6 +1865,11 @@ func _update_gun_wall(delta: float) -> void:
 		var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
 		if minf(verts[i0].x, minf(verts[i1].x, verts[i2].x)) < GUN_WALL_MINX:
 			continue
+		# Cut the end sections off: drop any triangle that reaches past the z-cut planes on either side.
+		if minf(verts[i0].z, minf(verts[i1].z, verts[i2].z)) < zlo:
+			continue
+		if maxf(verts[i0].z, maxf(verts[i1].z, verts[i2].z)) > zhi:
+			continue
 		for ii in [i0, i2, i1]:  # reversed winding (a reflection flips triangle handedness)
 			if have_n:
 				var n := norms[ii]
@@ -1873,8 +1877,7 @@ func _update_gun_wall(delta: float) -> void:
 			if have_uv:
 				st.set_uv(uvs[ii])
 			var tx := verts[ii].x - dx + GUN_WALL_CLOSER
-			var sz := zc + (verts[ii].z - zc) * zscale
-			st.add_vertex(Vector3(2.0 * cx - tx, verts[ii].y, sz))
+			st.add_vertex(Vector3(2.0 * cx - tx, verts[ii].y, verts[ii].z))
 		kept += 1
 	if kept == 0:
 		if not _gun_wall_logged:
