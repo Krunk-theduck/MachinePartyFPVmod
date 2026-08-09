@@ -36,6 +36,10 @@ const INFECTION_FLASH_CLASS: StringName = &"KnifeAtTheOfficePlayer"  # Inside Jo
 const DAMAGE_FLASH_COLOR := Color(0.55, 0.0, 0.0)
 const DAMAGE_FLASH_PEAK_ALPHA := 0.6  # bumped up so the "bloody" hit is unmissable
 const DAMAGE_FLASH_DECAY := 2.2
+# Inside Job (KnifeAtTheOffice): the infected/mutated player gets a GREEN overlay (their infection),
+# held the WHOLE time they're infected -- not the red one. Mid-light green, a touch above mid brightness.
+const INFECTION_FLASH_COLOR := Color(0.34, 0.72, 0.42)
+const INFECTION_FLASH_ALPHA := 0.45  # steady overlay opacity while infected/mutated (persistent, not a flash)
 
 const DAMAGE_SHAKE_MAGNITUDE := 0.10  # world units, peak random jitter right after a hit
 const DAMAGE_SHAKE_DECAY := 7.0       # faster than DAMAGE_FLASH_DECAY -- a jolt, not a wobble
@@ -1352,8 +1356,8 @@ func _update_damage_flash(delta: float) -> void:
 		_damage_flash_alpha *= exp(-delta * DAMAGE_FLASH_DECAY)
 		if _damage_flash_alpha < 0.01:  # snap the exponential's long tail to exactly 0
 			_damage_flash_alpha = 0.0
-		_damage_flash_rect.color = Color(DAMAGE_FLASH_COLOR.r, DAMAGE_FLASH_COLOR.g,
-			DAMAGE_FLASH_COLOR.b, _damage_flash_alpha)
+		var fc: Color = INFECTION_FLASH_COLOR if _player_class_name == INFECTION_FLASH_CLASS else DAMAGE_FLASH_COLOR
+		_damage_flash_rect.color = Color(fc.r, fc.g, fc.b, _damage_flash_alpha)
 
 	if _damage_shake_magnitude > 0.0:
 		_damage_shake_magnitude *= exp(-delta * DAMAGE_SHAKE_DECAY)
@@ -1367,9 +1371,11 @@ func _update_infection_flash() -> void:
 	if _player == null or not is_instance_valid(_player):
 		return
 	var infected: bool = "is_infected" in _player and bool(_player.get("is_infected"))
-	var is_active: bool = "active" in _player and bool(_player.get("active"))
-	if infected and not is_active:  # is_infected flips instantly, but active only comes back after the ~5s transformation anim -- flash for exactly that window
-		_damage_flash_alpha = DAMAGE_FLASH_PEAK_ALPHA
+	# Hold the green overlay the WHOLE time you're infected/mutated (is_infected flips the moment you're
+	# stabbed/infected and stays true), not just during the transformation window. Re-set each frame so
+	# it's persistent; when it clears, the decay fades it out.
+	if infected:
+		_damage_flash_alpha = INFECTION_FLASH_ALPHA
 
 
 func _update_one_life_overlay(delta: float) -> void:
