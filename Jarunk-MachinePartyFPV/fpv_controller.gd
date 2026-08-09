@@ -221,7 +221,7 @@ var _recipe_done: bool = false                       # gun fully assembled
 const SPEC_MODE_THIRD := 0
 const SPEC_MODE_FPV := 1
 const SPEC_MODE_FREEFLY := 2
-const SPEC_FREEFLY_SPEED := 9.0     # base free-fly move speed (units/sec)
+const SPEC_FREEFLY_SPEED := 16.0    # base free-fly move speed (units/sec)
 const SPEC_FREEFLY_LOOK := 0.0035   # free-fly mouse look sensitivity (rad/pixel)
 var _spec_engaged: bool = false     # my spectate system is active (I'm dead + spectating a live round)
 var _spec_mode: int = SPEC_MODE_THIRD  # third-person is the default
@@ -242,7 +242,13 @@ var _spec_prev_btn: Button = null
 var _spec_next_btn: Button = null
 var _spec_spawn_pos: Vector3 = Vector3.ZERO   # local player's spawn point (free-fly start)
 var _spec_spawn_captured: bool = false
-var _spec_grabbed_mouse: bool = false         # we captured the mouse for free-fly RMB look
+var _spec_grabbed_mouse: bool = false         # we captured the mouse for free-fly look
+var _spec_mg: Node = null                     # the minigame we're spectating (captured at engage)
+var _spec_smoothed_head: Vector3 = Vector3.ZERO  # FPV-spectate head smoothing (mirrors real FPV)
+var _spec_snap_head: bool = false             # snap (don't glide) on target/mode change
+var _spec_hidden_skel: Skeleton3D = null      # the spectated skeleton whose head we're hiding
+var _spec_hidden_idx: int = -1
+var _spec_hidden_orig_scale: Vector3 = Vector3.ONE
 
 # --- Mod-to-mod look networking (exact FPV look-around when the spectated player also has the mod) ---
 # The base game replicates body yaw + position but NOT the mod's independent head look. Mod peers
@@ -1817,6 +1823,15 @@ func _process(delta: float) -> void:
 	_net_time += delta
 	_fpv_net_broadcast(delta)  # self-gates: only streams while alive in a match with mod peers
 
+	# Spectator drive. Runs off the release flag (not the local rig), so it survives the dead body
+	# being removed/ragdolled. Returns false when spectating is genuinely over (minigame gone or we
+	# respawned) after tearing itself down -- then we fall through to normal processing this frame.
+	if _spectating_released:
+		if _update_spectate(delta):
+			return
+	elif _spec_engaged:
+		_spectate_disengage()
+
 	if _process_lobby_fpv(delta):
 		return
 
@@ -1843,11 +1858,6 @@ func _process(delta: float) -> void:
 	var have_rig := (_player != null and is_instance_valid(_player)
 		and _skeleton != null and is_instance_valid(_skeleton) and _head_bone_idx >= 0)
 	var active := have_rig and _player_is_active()
-
-	# Spectator UI/cam must disappear the instant we stop being a live-round spectator -- round over,
-	# match ended (rig gone), or respawned. Otherwise the name/arrows/buttons and our camera linger.
-	if _spec_engaged and (not _spectating_released or not have_rig):
-		_spectate_disengage()
 
 	# Forklift has three distinct inactive states, handled in priority order:
 	if have_rig and _player_class_name == &"ForkliftCertifiedVehicle":
@@ -2195,8 +2205,7 @@ func _class_from_skeleton_owner() -> StringName:
 
 func _process_death_cam(delta: float) -> void:
 	if _spectating_released:
-		_update_spectate(delta)  # my spectator system drives the view once we've handed to spectate
-		return
+		return  # the spectator system is driven from the top of _process once we've released
 
 	if not _dying:
 		_dying = true
@@ -2569,11 +2578,19 @@ func _native_stylebox(bg: Color) -> StyleBoxFlat:
 	return sb
 
 
-func _update_spectate(delta: float) -> void:
+func _update_spectate(delta: float) -> bool:
+	# Returns true while genuinely spectating (we drove the camera -> caller returns), false once it's
+	# over (we've already torn down + cleared the release flag -> caller falls through to normal play).
 	if not _spec_engaged:
 		_spectate_engage()
-	if _spec_cam == null or not is_instance_valid(_spec_cam):
-		return
+
+	# Over when the minigame is gone (round/match ended) or the local player is alive again.
+	var mg_gone: bool = _spec_mg == null or not is_instance_valid(_spec_mg) or not _spec_mg.is_inside_tree()
+	var respawned: bool = _player != null and is_instance_valid(_player) and _player_is_active()
+	if mg_gone or respawned or _spec_cam == null or not is_instance_valid(_spec_cam):
+		_spectating_released = false
+		_spectate_disengage()
+		return false
 
 	# Refresh the living-player roster periodically (players die / roles flip mid-round).
 	_spec_rebuild_accum += delta
@@ -2581,7 +2598,7 @@ func _update_spectate(delta: float) -> void:
 		_spec_rebuild_accum = 0.0
 		_spec_build_targets()
 
-	# Keep a valid, still-living target.
+	# Keep a valid, still-living target (free-fly is decoupled and doesn't need one on screen).
 	if _spec_target == null or not is_instance_valid(_spec_target) or not _spec_is_alive(_spec_target):
 		_spec_pick_target()
 
@@ -2593,12 +2610,71 @@ func _update_spectate(delta: float) -> void:
 	elif _spec_mode == SPEC_MODE_FPV:
 		if not _spec_cam.current:
 			_spec_cam.current = true
-		_spec_update_fpv()
+		_spec_update_fpv(delta)
 	else:
 		_spec_update_third()
 
 	_spec_update_ui()
 	_spec_update_mouse()
+	return true
+
+
+func _spectate_engage() -> void:
+	_spec_engaged = true
+	_spec_mode = SPEC_MODE_THIRD
+	_spec_grabbed_mouse = false
+	_spec_snap_head = true
+	_spec_rebuild_accum = 0.0
+	_spec_mg = _spec_minigame()   # capture the minigame node -- lifecycle no longer depends on _player
+	_spec_build_targets()
+	_spec_pick_target()
+
+	_spec_cam = Camera3D.new()
+	_spec_cam.name = "FpvSpectatorCamera"
+	get_tree().root.add_child(_spec_cam)
+	# NOT made current here -- the default third-person mode hands to the game's own camera.
+
+	_spec_freefly_yaw = 0.0
+	_spec_freefly_pitch = -0.12
+
+	if _spec_toggle_btn:
+		_spec_toggle_btn.visible = true
+	if _spec_freefly_btn:
+		_spec_freefly_btn.visible = true
+	if _spec_name_panel:
+		_spec_name_panel.visible = true
+	if _spec_prev_btn:
+		_spec_prev_btn.visible = true
+	if _spec_next_btn:
+		_spec_next_btn.visible = true
+	_spec_refresh_buttons()
+	print("[fpv_mod] spectate engaged (", _spec_targets.size(), " living targets)")
+
+
+func _spectate_disengage() -> void:
+	_spec_restore_hidden_head()  # un-hide whoever's head we hid for FPV
+	if _spec_grabbed_mouse and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	_spec_grabbed_mouse = false
+	if _spec_cam and is_instance_valid(_spec_cam):
+		_spec_cam.current = false
+		if _spec_cam.get_parent() != null:
+			_spec_cam.get_parent().remove_child(_spec_cam)
+		_spec_cam.queue_free()
+	_spec_cam = null
+	_spec_target = null
+	_spec_targets.clear()
+	_spec_mg = null
+	if _spec_toggle_btn:
+		_spec_toggle_btn.visible = false
+	if _spec_freefly_btn:
+		_spec_freefly_btn.visible = false
+	if _spec_name_panel:
+		_spec_name_panel.visible = false
+	if not _spec_engaged:
+		return
+	_spec_engaged = false
+	print("[fpv_mod] spectate disengaged")
 
 
 func _spectate_engage() -> void:
@@ -2667,7 +2743,9 @@ func _spec_minigame() -> Node:
 
 
 func _spec_build_targets() -> void:
-	var mg := _spec_minigame()
+	var mg: Node = _spec_mg
+	if mg == null or not is_instance_valid(mg):
+		mg = _spec_minigame()
 	if mg == null:
 		return
 	var skels: Array = []
@@ -2764,6 +2842,7 @@ func _spec_pick_target() -> void:
 	if _spec_target != null and is_instance_valid(_spec_target) and _spec_target in _spec_targets and _spec_is_alive(_spec_target):
 		return
 	_spec_target = _spec_targets[0]
+	_spec_snap_head = true  # new target -> jump the FPV head, don't glide across the map
 
 
 func _spec_cycle(dir: int) -> void:
@@ -2778,6 +2857,7 @@ func _spec_cycle(dir: int) -> void:
 		if idx < 0:
 			idx += _spec_targets.size()
 	_spec_target = _spec_targets[idx]
+	_spec_snap_head = true
 
 
 func _spec_head_origin(t: Node) -> Vector3:
@@ -2806,6 +2886,7 @@ func _spec_body_yaw(t: Node) -> float:
 func _spec_update_third() -> void:
 	# The default view is the game's OWN 3rd-person spectator/overview camera -- the exact vanilla
 	# view a dead player sees. We just re-assert it as current and release ours; never a custom orbit.
+	_spec_restore_hidden_head()  # show their head again in 3rd person
 	if _spec_cam != null and is_instance_valid(_spec_cam) and _spec_cam.current:
 		_spec_cam.current = false
 	var gcam := _find_game_camera(true)
@@ -2817,33 +2898,83 @@ func _spec_update_third() -> void:
 		gcam.current = true
 
 
-func _spec_update_fpv() -> void:
+func _spec_update_fpv(delta: float) -> void:
+	# Reuse the EXACT first-person rig on the spectated player: camera pinned to their head bone (which
+	# bobs with their animation), their head hidden, the same smoothing our own FPV uses. It should feel
+	# just like our FPV was theirs.
 	var t := _spec_target
 	if t == null or not is_instance_valid(t):
 		return
-	# If this player owns a networked camera (the Duck Hunt hunter's aim/scope cam), mirror it exactly
-	# -- the base game replicates that camera to every client, so it works with no mod on their end.
+	# Duck Hunt hunter: exact networked scope cam (a gun rig, no humanoid head to pin to).
 	if _spec_use_owned_camera(t):
+		_spec_restore_hidden_head()
 		var oc = t.get("camera")
 		if oc is Camera3D and is_instance_valid(oc) and oc != _spec_cam:
 			_spec_cam.global_transform = (oc as Camera3D).global_transform
-			return
-	# If the spectated player also runs the mod, use their exact streamed head look (yaw+pitch).
+		return
+	var sk := _first_skeleton_with_head(t, [SCAN_BUDGET])
+	if sk == null:
+		_spec_restore_hidden_head()
+		return
+	var idx: int = sk.find_bone("head")
+
+	# Look: exact streamed look if they also run the mod; otherwise their body facing (non-mod rule).
+	var yaw: float = 0.0
+	var pitch: float = 0.0
 	var nid := _spec_id_of(t)
-	if nid != 0 and _fpv_looks.has(nid):
-		var d = _fpv_looks[nid]
-		if _net_time - float(d["t"]) < FPV_NET_STALE:
-			var lyaw := float(d["yaw"])
-			var lfwd := Vector3(-sin(lyaw), 0.0, -cos(lyaw))
-			_spec_cam.global_position = _spec_head_origin(t) + lfwd * 0.05 + Vector3(0.0, 0.02, 0.0)
-			_spec_cam.global_rotation = Vector3(float(d["pitch"]), lyaw, 0.0)
-			return
-	# Fallback (matches a non-modded player's view): sit at their head, face their body direction.
-	var head := _spec_head_origin(t)
-	var yaw := _spec_body_yaw(t)
-	var fwd := Vector3(-sin(yaw), 0.0, -cos(yaw))
-	_spec_cam.global_position = head + fwd * 0.08 + Vector3(0.0, 0.02, 0.0)
-	_spec_cam.global_rotation = Vector3(0.0, yaw, 0.0)
+	if nid != 0 and _fpv_looks.has(nid) and _net_time - float(_fpv_looks[nid]["t"]) < FPV_NET_STALE:
+		yaw = float(_fpv_looks[nid]["yaw"])
+		pitch = float(_fpv_looks[nid]["pitch"])
+	else:
+		yaw = _spec_body_yaw(t)
+	var look_basis := Basis(Vector3.UP, yaw) * Basis(Vector3.RIGHT, pitch)
+
+	# Head-bone eye position, smoothed exactly like real FPV (lateral/vertical eased, forward instant).
+	var head_xform: Transform3D = sk.global_transform * sk.get_bone_global_pose(idx)
+	var target_head: Vector3 = head_xform.origin + _spec_eye_offset(yaw)
+	var grounded: bool = not (t is CharacterBody3D) or (t as CharacterBody3D).is_on_floor()
+	if _spec_snap_head or not grounded or _spec_smoothed_head.distance_to(target_head) > HEAD_TELEPORT_SNAP_DISTANCE:
+		_spec_smoothed_head = target_head
+		_spec_snap_head = false
+	else:
+		_spec_smoothed_head = _spec_smooth_head_toward(_spec_smoothed_head, target_head, delta, yaw)
+	_spec_cam.global_transform = Transform3D(look_basis, _spec_smoothed_head)
+
+	# Hide their head so we're not looking at the inside of it (re-applied each frame; restored on exit).
+	_spec_hide_head(sk, idx)
+
+
+func _spec_eye_offset(yaw: float) -> Vector3:
+	# Same eye offset our FPV uses (per-class magnitudes), but rotated by the SPECTATED look yaw.
+	var forward: Vector3 = Basis(Vector3.UP, yaw) * Vector3(0, 0, -1)
+	var left: Vector3 = Basis(Vector3.UP, yaw) * Vector3(-1, 0, 0)
+	return forward * _eye_forward_offset + Vector3.UP * _eye_up_offset + left * _eye_left_offset
+
+
+func _spec_smooth_head_toward(current: Vector3, target: Vector3, delta: float, yaw: float) -> Vector3:
+	var forward: Vector3 = Basis(Vector3.UP, yaw) * Vector3(0, 0, -1)
+	var right: Vector3 = Basis(Vector3.UP, yaw) * Vector3(1, 0, 0)
+	var d: Vector3 = target - current
+	var w: float = 1.0 - exp(-delta * HEAD_BOB_SMOOTHING)
+	return current + Vector3.UP * (d.y * w) + right * (d.dot(right) * w) + forward * d.dot(forward)
+
+
+func _spec_hide_head(sk: Skeleton3D, idx: int) -> void:
+	if sk == null or not is_instance_valid(sk) or idx < 0:
+		return
+	if _spec_hidden_skel != sk or _spec_hidden_idx != idx:
+		_spec_restore_hidden_head()  # un-hide the previous target's head first
+		_spec_hidden_skel = sk
+		_spec_hidden_idx = idx
+		_spec_hidden_orig_scale = sk.get_bone_pose_scale(idx)
+	sk.set_bone_pose_scale(idx, Vector3.ONE * HEAD_HIDE_SCALE)
+
+
+func _spec_restore_hidden_head() -> void:
+	if _spec_hidden_skel != null and is_instance_valid(_spec_hidden_skel) and _spec_hidden_idx >= 0:
+		_spec_hidden_skel.set_bone_pose_scale(_spec_hidden_idx, _spec_hidden_orig_scale)
+	_spec_hidden_skel = null
+	_spec_hidden_idx = -1
 
 
 func _spec_use_owned_camera(t: Node) -> bool:
@@ -2853,11 +2984,10 @@ func _spec_use_owned_camera(t: Node) -> bool:
 
 
 func _spec_update_freefly(delta: float) -> void:
+	_spec_restore_hidden_head()  # free-fly is decoupled from the spectated player
 	var speed := SPEC_FREEFLY_SPEED
 	if Input.is_key_pressed(KEY_SHIFT):
-		speed *= 3.0
-	if Input.is_key_pressed(KEY_ALT):
-		speed *= 0.3
+		speed *= 3.5
 	var basis := Basis.from_euler(Vector3(_spec_freefly_pitch, _spec_freefly_yaw, 0.0))
 	var dir := Vector3.ZERO
 	if Input.is_key_pressed(KEY_W):
@@ -2878,17 +3008,40 @@ func _spec_update_freefly(delta: float) -> void:
 
 
 func _spec_update_mouse() -> void:
-	var want_capture := _spec_mode == SPEC_MODE_FREEFLY and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
+	# Free-fly = full mouselook with a captured cursor (no button to hold, clicks can't exit it). Hold
+	# Left Alt (or open pause) to reveal the cursor so you can click "Exit Free Cam". Every other mode
+	# keeps the cursor free so the on-screen buttons are clickable.
+	var pause_menu := get_node_or_null("/root/PauseMenu")
+	var paused: bool = pause_menu != null and bool(pause_menu.get("active"))
+	var want_capture: bool = _spec_mode == SPEC_MODE_FREEFLY and not paused and not Input.is_key_pressed(KEY_ALT)
 	if want_capture:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
-			_spec_grabbed_mouse = true
-	elif _spec_grabbed_mouse:
-		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+		_spec_grabbed_mouse = true
+	else:
+		if _spec_grabbed_mouse and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 		_spec_grabbed_mouse = false
 
 
 func _spec_update_ui() -> void:
+	# Free-fly is its own thing -- decoupled from spectating a player. Show that, hide the cycle arrows.
+	if _spec_mode == SPEC_MODE_FREEFLY:
+		if _spec_prev_btn:
+			_spec_prev_btn.visible = false
+		if _spec_next_btn:
+			_spec_next_btn.visible = false
+		if _spec_name_label:
+			_spec_name_label.text = "In Free Cam mode"
+		if _spec_role_label:
+			_spec_role_label.text = "hold Alt for cursor"
+			_spec_role_label.add_theme_color_override("font_color", Color(0.7, 0.7, 0.72))
+			_spec_role_label.visible = true
+		return
+	if _spec_prev_btn:
+		_spec_prev_btn.visible = true
+	if _spec_next_btn:
+		_spec_next_btn.visible = true
 	if _spec_target != null and is_instance_valid(_spec_target):
 		if _spec_name_label:
 			_spec_name_label.text = _spec_name_of(_spec_target)
@@ -2957,7 +3110,7 @@ func _spec_refresh_buttons() -> void:
 			_spec_toggle_btn.text = "Switch to FPV view"
 	if _spec_freefly_btn:
 		if _spec_mode == SPEC_MODE_FREEFLY:
-			_spec_freefly_btn.text = "Exit free-fly"
+			_spec_freefly_btn.text = "Exit Free Cam"
 		else:
 			_spec_freefly_btn.text = "Free-fly cam"
 
@@ -2968,6 +3121,7 @@ func _on_spec_toggle_pressed() -> void:
 	if _spec_mode == SPEC_MODE_FPV:
 		_spec_mode = SPEC_MODE_THIRD
 	else:
+		_spec_snap_head = true  # jump straight onto the head, don't glide in from third/free
 		_spec_mode = SPEC_MODE_FPV  # from third OR free-fly, the toggle goes to FPV
 	_spec_refresh_buttons()
 
@@ -2976,16 +3130,19 @@ func _on_spec_freefly_pressed() -> void:
 	if not _spec_engaged:
 		return
 	if _spec_mode == SPEC_MODE_FREEFLY:
-		_spec_mode = SPEC_MODE_THIRD
+		_spec_mode = SPEC_MODE_THIRD  # back to normal spectating
 	else:
-		if _spec_spawn_captured:
-			_spec_freefly_pos = _spec_spawn_pos
+		# Spawn AT one of the players (their head), facing the way they face -- then fly anywhere.
+		var anchor: Node = _spec_target
+		if anchor == null or not is_instance_valid(anchor):
+			if not _spec_targets.is_empty():
+				anchor = _spec_targets[0]
+		if anchor != null and is_instance_valid(anchor):
+			_spec_freefly_yaw = _spec_body_yaw(anchor)
+			_spec_freefly_pitch = 0.0
+			_spec_freefly_pos = _spec_head_origin(anchor) + Vector3(0.0, 0.3, 0.0)
 		elif _spec_cam and is_instance_valid(_spec_cam):
 			_spec_freefly_pos = _spec_cam.global_position
-		if _spec_cam and is_instance_valid(_spec_cam):
-			var e := _spec_cam.global_transform.basis.get_euler()
-			_spec_freefly_yaw = e.y
-			_spec_freefly_pitch = clamp(e.x, -1.4, 1.4)
 		_spec_mode = SPEC_MODE_FREEFLY
 	_spec_refresh_buttons()
 
