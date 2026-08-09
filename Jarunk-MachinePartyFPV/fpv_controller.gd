@@ -258,6 +258,8 @@ var _spec_look_yaw: float = 0.0               # FPV-spectate self-look offset fr
 var _spec_look_pitch: float = 0.0
 var _spec_look_rel: Vector2 = Vector2.ZERO    # mouse motion accumulated while Shift-looking
 var _spec_end_accum: float = 0.0              # hysteresis: a 1-frame blip can't end spectate/free-cam
+var _spec_shared_dist: float = 12.0           # shared-camera games: base cam distance (captured once)
+var _spec_shared_captured: bool = false
 
 # --- Mod-to-mod look networking (exact FPV look-around when the spectated player also has the mod) ---
 # The base game replicates body yaw + position but NOT the mod's independent head look. Mod peers
@@ -2652,6 +2654,7 @@ func _spectate_engage() -> void:
 	_spec_end_accum = 0.0
 	_spec_look_yaw = 0.0
 	_spec_look_pitch = 0.0
+	_spec_shared_captured = false
 	_spec_mg = _spec_minigame()   # capture the minigame node -- lifecycle no longer depends on _player
 	_spec_build_targets()
 	_spec_pick_target()
@@ -2884,8 +2887,9 @@ func _spec_update_third() -> void:
 	if _spec_drive_native_spectate(t):
 		return
 
-	# (B) Games where each player owns their spectate/gameplay camera (e.g. Inside Job's top-down):
-	# show the selected player's OWN camera, so cycling switches the native view with no custom cam.
+	# (B) Games where each player owns their spectate/gameplay camera (Inside Job top-down, burn recycle
+	# seat cam, shape cutter, ...): show the selected player's OWN camera. It's a child of that player,
+	# so it already frames them with the game's exact angle -- cycling just switches whose we show.
 	if t != null and is_instance_valid(t) and "camera" in t:
 		var tc = t.get("camera")
 		if tc is Camera3D and is_instance_valid(tc):
@@ -2893,14 +2897,45 @@ func _spec_update_third() -> void:
 				(tc as Camera3D).current = true
 			return
 
-	# (C) Single fixed spectator/overview camera -- just re-assert the game's own.
+	# (C) Single shared/overview camera (Wrong Way, forklift, smoke break, collar race): there is no
+	# per-player cam to switch to, so we follow the chosen player OURSELVES using the base camera's LIVE
+	# angle -- exactly the game's framing, just re-centred on who you picked with the arrows.
 	var gcam := _find_game_camera(true)
 	if gcam == null and _orig_camera != null and is_instance_valid(_orig_camera):
 		gcam = _orig_camera
+	if t != null and is_instance_valid(t) and t is Node3D:
+		var base_basis: Basis = Basis.from_euler(Vector3(deg_to_rad(-22.0), _spec_body_yaw(t), 0.0))
+		if gcam != null and is_instance_valid(gcam):
+			base_basis = gcam.global_transform.basis  # the game's exact live angle (keeps any pan)
+			if not _spec_shared_captured:
+				_spec_shared_dist = clampf(gcam.global_position.distance_to(_spec_players_centroid()), 6.0, 45.0)
+				_spec_shared_captured = true
+		if not _spec_cam.current:
+			_spec_cam.current = true
+		var fwd: Vector3 = -base_basis.z
+		var subj: Vector3 = _spec_head_origin(t)
+		_spec_cam.global_transform = Transform3D(base_basis, subj - fwd * _spec_shared_dist)
+		return
+
+	# Nothing to follow -> re-assert the game's own camera.
 	if gcam == null:
 		gcam = _find_fallback_camera()
 	if gcam != null and is_instance_valid(gcam) and not gcam.current:
 		gcam.current = true
+
+
+func _spec_players_centroid() -> Vector3:
+	var acc := Vector3.ZERO
+	var n := 0
+	for p in _spec_targets:
+		if p is Node3D and is_instance_valid(p):
+			acc += (p as Node3D).global_position
+			n += 1
+	if n > 0:
+		return acc / float(n)
+	if _spec_target is Node3D and is_instance_valid(_spec_target):
+		return (_spec_target as Node3D).global_position
+	return Vector3.ZERO
 
 
 func _spec_drive_native_spectate(t: Node) -> bool:
@@ -3029,8 +3064,9 @@ func _spec_update_freefly(delta: float) -> void:
 	_spec_restore_hidden_head()  # free-fly is decoupled from the spectated player
 	var device := _spec_pad_device()
 
-	# Controller right-stick look.
-	if device >= 0:
+	# Look-around is a HOLD (mouse look is handled via Shift-capture in _input): on a controller, hold
+	# LB and steer with the right stick. LB is otherwise unused in free cam.
+	if device >= 0 and Input.is_joy_button_pressed(device, JOY_BUTTON_LEFT_SHOULDER):
 		var lv := Vector2(Input.get_joy_axis(device, JOY_AXIS_RIGHT_X), Input.get_joy_axis(device, JOY_AXIS_RIGHT_Y))
 		var lm: float = lv.length()
 		if lm > CONTROLLER_LOOK_DEADZONE:
@@ -3039,8 +3075,6 @@ func _spec_update_freefly(delta: float) -> void:
 			_spec_freefly_pitch = clamp(_spec_freefly_pitch - ls.y * SPEC_FREEFLY_PAD_LOOK * delta, -1.4, 1.4)
 
 	var speed := SPEC_FREEFLY_SPEED
-	if Input.is_key_pressed(KEY_SHIFT):
-		speed *= 3.5
 	var basis := Basis.from_euler(Vector3(_spec_freefly_pitch, _spec_freefly_yaw, 0.0))
 	var dir := Vector3.ZERO
 	if Input.is_key_pressed(KEY_W):
@@ -3076,17 +3110,14 @@ func _spec_update_freefly(delta: float) -> void:
 
 
 func _spec_update_mouse() -> void:
-	# Free-fly = full mouselook with a captured cursor (no button to hold, clicks can't exit it). Hold
-	# Left Alt (or open pause) to reveal the cursor so you can click "Exit Free Cam". On a controller we
-	# never grab the cursor (the sticks handle look). Every other mode keeps the cursor free for the UI.
+	# Looking around (free-cam AND FPV) is a HOLD: press Shift to capture the mouse and look; let go and
+	# the cursor is free to click the buttons (no Alt needed). Controllers never grab the cursor.
 	var pause_menu := get_node_or_null("/root/PauseMenu")
 	var paused: bool = pause_menu != null and bool(pause_menu.get("active"))
 	var want_capture: bool = false
-	if not paused and not _last_input_was_pad:
-		if _spec_mode == SPEC_MODE_FREEFLY and not Input.is_key_pressed(KEY_ALT):
+	if not paused and not _last_input_was_pad and Input.is_key_pressed(KEY_SHIFT):
+		if _spec_mode == SPEC_MODE_FREEFLY or _spec_mode == SPEC_MODE_FPV:
 			want_capture = true
-		elif _spec_mode == SPEC_MODE_FPV and Input.is_key_pressed(KEY_SHIFT):
-			want_capture = true  # Shift-look: capture so you can sweep the full range
 	if want_capture:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -3178,8 +3209,8 @@ func _spec_update_ui() -> void:
 		if _spec_name_label:
 			_spec_name_label.text = "In Free Cam mode"
 		if _spec_role_label:
-			_spec_role_label.text = "left stick move / X exit" if _last_input_was_pad else "hold Alt for cursor"
-			_spec_role_label.add_theme_color_override("font_color", Color(0.7, 0.7, 0.72))
+			_spec_role_label.text = "hold Shift / LB to look around"
+			_spec_role_label.add_theme_color_override("font_color", Color(0.72, 0.72, 0.75))
 			_spec_role_label.visible = true
 		return
 	if _spec_prev_btn:
