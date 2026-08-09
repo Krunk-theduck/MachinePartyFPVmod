@@ -254,6 +254,10 @@ var _spec_hidden_orig_scale: Vector3 = Vector3.ONE
 var _pad_edge: Dictionary = {}                # per-button held-state for controller edge detection
 var _last_input_was_pad: bool = false         # live input-device detection (drives UI button hints)
 var _spec_pad_ui_state: int = -1              # cached pad/mouse state the spectate labels reflect
+var _spec_look_yaw: float = 0.0               # FPV-spectate self-look offset from the body's forward
+var _spec_look_pitch: float = 0.0
+var _spec_look_rel: Vector2 = Vector2.ZERO    # mouse motion accumulated while Shift-looking
+var _spec_end_accum: float = 0.0              # hysteresis: a 1-frame blip can't end spectate/free-cam
 
 # --- Mod-to-mod look networking (exact FPV look-around when the spectated player also has the mod) ---
 # The base game replicates body yaw + position but NOT the mod's independent head look. Mod peers
@@ -1825,8 +1829,6 @@ func _smooth_head_pos_toward(current: Vector3, target: Vector3, delta: float) ->
 
 func _process(delta: float) -> void:
 	_update_secret_level_floor(delta)
-	_net_time += delta
-	_fpv_net_broadcast(delta)  # self-gates: only streams while alive in a match with mod peers
 
 	# Spectator drive. Runs off the release flag (not the local rig), so it survives the dead body
 	# being removed/ragdolled. Returns false when spectating is genuinely over (minigame gone or we
@@ -2589,13 +2591,28 @@ func _update_spectate(delta: float) -> bool:
 	if not _spec_engaged:
 		_spectate_engage()
 
-	# Over when the minigame is gone (round/match ended) or the local player is alive again.
+	# Camera lost unexpectedly -> rebuild it and keep going. Never tear the whole thing down for this,
+	# or it would reset the mode and kick you out of free-cam.
+	if _spec_cam == null or not is_instance_valid(_spec_cam):
+		_spec_cam = Camera3D.new()
+		_spec_cam.name = "FpvSpectatorCamera"
+		get_tree().root.add_child(_spec_cam)
+		_spec_snap_head = true
+	# End only when the minigame is truly gone (round/match ended) or the local player is genuinely
+	# alive again -- and only once that has HELD for ~0.3s. A single-frame flag blip (some minigames
+	# flicker the dead player's state between rounds) must NOT tear spectate down, or it re-engages and
+	# kicks you out of free-cam. Free-cam otherwise persists until you explicitly leave it.
 	var mg_gone: bool = _spec_mg == null or not is_instance_valid(_spec_mg) or not _spec_mg.is_inside_tree()
-	var respawned: bool = _player != null and is_instance_valid(_player) and _player_is_active()
-	if mg_gone or respawned or _spec_cam == null or not is_instance_valid(_spec_cam):
-		_spectating_released = false
-		_spectate_disengage()
-		return false
+	var alive_again: bool = _player != null and is_instance_valid(_player) and _player_is_active() \
+		and not ("is_alive" in _player and not bool(_player.get("is_alive")))
+	if mg_gone or alive_again:
+		_spec_end_accum += delta
+		if _spec_end_accum >= 0.3:
+			_spectating_released = false
+			_spectate_disengage()
+			return false
+	else:
+		_spec_end_accum = 0.0
 
 	# Refresh the living-player roster periodically (players die / roles flip mid-round).
 	_spec_rebuild_accum += delta
@@ -2632,6 +2649,9 @@ func _spectate_engage() -> void:
 	_spec_grabbed_mouse = false
 	_spec_snap_head = true
 	_spec_rebuild_accum = 0.0
+	_spec_end_accum = 0.0
+	_spec_look_yaw = 0.0
+	_spec_look_pitch = 0.0
 	_spec_mg = _spec_minigame()   # capture the minigame node -- lifecycle no longer depends on _player
 	_spec_build_targets()
 	_spec_pick_target()
@@ -2693,6 +2713,16 @@ func _spec_minigame() -> Node:
 			return cur
 		cur = cur.get_parent()
 	return null
+
+
+func _spec_mg_is(substr: String) -> bool:
+	# Identify the current minigame by its script path / node name (e.g. "chisel").
+	if _spec_mg == null or not is_instance_valid(_spec_mg):
+		return false
+	var sc: Script = _spec_mg.get_script()
+	if sc != null and sc.resource_path.to_lower().contains(substr):
+		return true
+	return String(_spec_mg.name).to_lower().contains(substr)
 
 
 func _spec_build_targets() -> void:
@@ -2796,6 +2826,8 @@ func _spec_pick_target() -> void:
 		return
 	_spec_target = _spec_targets[0]
 	_spec_snap_head = true  # new target -> jump the FPV head, don't glide across the map
+	_spec_look_yaw = 0.0
+	_spec_look_pitch = 0.0
 
 
 func _spec_cycle(dir: int) -> void:
@@ -2811,6 +2843,8 @@ func _spec_cycle(dir: int) -> void:
 			idx += _spec_targets.size()
 	_spec_target = _spec_targets[idx]
 	_spec_snap_head = true
+	_spec_look_yaw = 0.0
+	_spec_look_pitch = 0.0
 
 
 func _spec_head_origin(t: Node) -> Vector3:
@@ -2837,20 +2871,60 @@ func _spec_body_yaw(t: Node) -> float:
 
 
 func _spec_update_third() -> void:
-	# Our OWN follow-cam behind the selected player. This is what makes the cycle arrows actually change
-	# who you watch -- and it means the base game's click-to-switch-player can't affect what you see,
-	# because our camera (not the game's spectator cam) is always the one on screen.
+	# The BASE GAME's own 3rd-person spectate camera (OG feel) -- we never build our own. We just make
+	# our arrows drive WHICH player it shows, and block the base game's click-to-switch.
 	_spec_restore_hidden_head()  # show their head again in 3rd person
 	var t := _spec_target
-	if t == null or not is_instance_valid(t) or not (t is Node3D):
+	if _spec_cam != null and is_instance_valid(_spec_cam) and _spec_cam.current:
+		_spec_cam.current = false
+
+	# (A) Duck Hunt: it follows minigame.spectate_player. We run AFTER its _process (priority 4096), so
+	# writing spectate_player to our target every frame makes the arrows control it AND overrides any
+	# left/right-click switch the game just processed -- the click can no longer change who you watch.
+	if _spec_drive_native_spectate(t):
 		return
-	if not _spec_cam.current:
-		_spec_cam.current = true
-	var head := _spec_head_origin(t)
-	var yaw := _spec_body_yaw(t)
-	var fwd := Vector3(-sin(yaw), 0.0, -cos(yaw))  # the way the body faces
-	_spec_cam.global_position = head - fwd * 3.2 + Vector3(0.0, 1.0, 0.0)  # behind + above
-	_spec_cam.look_at(head + Vector3(0.0, 0.1, 0.0), Vector3.UP)
+
+	# (B) Games where each player owns their spectate/gameplay camera (e.g. Inside Job's top-down):
+	# show the selected player's OWN camera, so cycling switches the native view with no custom cam.
+	if t != null and is_instance_valid(t) and "camera" in t:
+		var tc = t.get("camera")
+		if tc is Camera3D and is_instance_valid(tc):
+			if not (tc as Camera3D).current:
+				(tc as Camera3D).current = true
+			return
+
+	# (C) Single fixed spectator/overview camera -- just re-assert the game's own.
+	var gcam := _find_game_camera(true)
+	if gcam == null and _orig_camera != null and is_instance_valid(_orig_camera):
+		gcam = _orig_camera
+	if gcam == null:
+		gcam = _find_fallback_camera()
+	if gcam != null and is_instance_valid(gcam) and not gcam.current:
+		gcam.current = true
+
+
+func _spec_drive_native_spectate(t: Node) -> bool:
+	# Force the game's native follow-spectate onto our chosen target (Duck Hunt). Returns true if it
+	# handled the view. Only fires when the target is in the game's own spectate-able list.
+	var mg: Node = _spec_mg
+	if mg == null or not is_instance_valid(mg):
+		return false
+	if not ("spectate_duck_players" in mg and "spectate_player" in mg):
+		return false
+	if t == null or not is_instance_valid(t):
+		return false
+	var list = mg.get("spectate_duck_players")
+	if not (list is Array):
+		return false
+	var idx: int = (list as Array).find(t)
+	if idx < 0:
+		return false  # not a spectate-able duck (e.g. the hunter) -> caller uses the player's own cam
+	mg.set("spectator_index", idx)
+	mg.set("spectate_player", t)  # overrides the click every frame; drives the follow-cam to our pick
+	var bc = mg.get("backup_camera")
+	if bc is Camera3D and is_instance_valid(bc) and not (bc as Camera3D).current:
+		(bc as Camera3D).current = true
+	return true
 
 
 func _spec_update_fpv(delta: float) -> void:
@@ -2873,15 +2947,11 @@ func _spec_update_fpv(delta: float) -> void:
 		return
 	var idx: int = sk.find_bone("head")
 
-	# Look: exact streamed look if they also run the mod; otherwise their body facing (non-mod rule).
-	var yaw: float = 0.0
-	var pitch: float = 0.0
-	var nid := _spec_id_of(t)
-	if nid != 0 and _fpv_looks.has(nid) and _net_time - float(_fpv_looks[nid]["t"]) < FPV_NET_STALE:
-		yaw = float(_fpv_looks[nid]["yaw"])
-		pitch = float(_fpv_looks[nid]["pitch"])
-	else:
-		yaw = _spec_body_yaw(t)
+	# Look faces the way their body faces; hold Shift (or use the right stick) to look around yourself,
+	# clamped exactly like the lobby view. This is your own look -- we don't mirror their mouse.
+	_spec_apply_self_look(delta)
+	var yaw: float = _spec_body_yaw(t) + _spec_look_yaw
+	var pitch: float = _spec_look_pitch
 	var look_basis := Basis(Vector3.UP, yaw) * Basis(Vector3.RIGHT, pitch)
 
 	# Head-bone eye position, smoothed exactly like real FPV (lateral/vertical eased, forward instant).
@@ -2897,6 +2967,23 @@ func _spec_update_fpv(delta: float) -> void:
 
 	# Hide their head so we're not looking at the inside of it (re-applied each frame; restored on exit).
 	_spec_hide_head(sk, idx)
+
+
+func _spec_apply_self_look(delta: float) -> void:
+	# You look around from the spectated player's head yourself. Mouse look only while Shift is held;
+	# controller right-stick always looks (it's free in FPV). Offsets clamped like the lobby view.
+	var yaw_limit: float = deg_to_rad(LOBBY_FPV_YAW_LIMIT_DEG)
+	var pitch_limit: float = deg_to_rad(LOBBY_FPV_PITCH_LIMIT_DEG)
+	if Input.is_key_pressed(KEY_SHIFT):
+		_spec_look_yaw -= _spec_look_rel.x * LOBBY_FPV_MOUSE_SENS
+		_spec_look_pitch -= _spec_look_rel.y * LOBBY_FPV_MOUSE_SENS
+	var stick := _lobby_stick_vector()  # right stick, deadzoned
+	if stick != Vector2.ZERO:
+		_spec_look_yaw -= stick.x * LOBBY_FPV_STICK_SPEED * delta
+		_spec_look_pitch -= stick.y * LOBBY_FPV_STICK_SPEED * delta
+	_spec_look_yaw = clampf(_spec_look_yaw, -yaw_limit, yaw_limit)
+	_spec_look_pitch = clampf(_spec_look_pitch, -pitch_limit, pitch_limit)
+	_spec_look_rel = Vector2.ZERO
 
 
 func _spec_eye_offset(yaw: float) -> Vector3:
@@ -2994,7 +3081,12 @@ func _spec_update_mouse() -> void:
 	# never grab the cursor (the sticks handle look). Every other mode keeps the cursor free for the UI.
 	var pause_menu := get_node_or_null("/root/PauseMenu")
 	var paused: bool = pause_menu != null and bool(pause_menu.get("active"))
-	var want_capture: bool = _spec_mode == SPEC_MODE_FREEFLY and not paused and not _last_input_was_pad and not Input.is_key_pressed(KEY_ALT)
+	var want_capture: bool = false
+	if not paused and not _last_input_was_pad:
+		if _spec_mode == SPEC_MODE_FREEFLY and not Input.is_key_pressed(KEY_ALT):
+			want_capture = true
+		elif _spec_mode == SPEC_MODE_FPV and Input.is_key_pressed(KEY_SHIFT):
+			want_capture = true  # Shift-look: capture so you can sweep the full range
 	if want_capture:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -3056,6 +3148,26 @@ func _spec_update_ui() -> void:
 	if _spec_pad_ui_state != int(_last_input_was_pad):
 		_spec_pad_ui_state = int(_last_input_was_pad)
 		_spec_refresh_buttons()
+
+	var in_chisel := _spec_mg_is("chisel")
+	var on_hunter: bool = _spec_target != null and is_instance_valid(_spec_target) and _spec_role_for(_spec_target) == "HUNTER"
+
+	# Duck Hunt hunter: no FPV toggle -- its 3rd-person view already IS its scope. Drop out of FPV if
+	# we cycled onto it while in FPV. Shows back the moment you cycle to someone else.
+	if on_hunter and _spec_mode == SPEC_MODE_FPV:
+		_spec_mode = SPEC_MODE_THIRD
+		_spec_refresh_buttons()
+	if _spec_toggle_btn:
+		_spec_toggle_btn.visible = not in_chisel and not on_hunter
+
+	# Chisel Gauntlet only has a fixed per-player spectate camera -- cycling/FPV do nothing there, so
+	# leave ONLY the free-cam button.
+	if in_chisel:
+		if _spec_name_panel:
+			_spec_name_panel.visible = false
+		return
+	if _spec_name_panel and not _spec_name_panel.visible:
+		_spec_name_panel.visible = true
 
 	# Free-fly is its own thing -- decoupled from spectating a player. Show that, hide the cycle arrows.
 	if _spec_mode == SPEC_MODE_FREEFLY:
@@ -3142,7 +3254,10 @@ func _spec_refresh_buttons() -> void:
 		_spec_toggle_btn.text = ("[Y]  " + t_base) if pad else t_base
 	if _spec_freefly_btn:
 		var f_base: String = "Exit Free Cam" if _spec_mode == SPEC_MODE_FREEFLY else "Free-fly cam"
-		_spec_freefly_btn.text = ("[X]  " + f_base) if pad else f_base
+		if pad:
+			_spec_freefly_btn.text = "[X]  " + f_base
+		else:
+			_spec_freefly_btn.text = f_base + "  (F5)"
 	if _spec_prev_btn:
 		_spec_prev_btn.text = "LB" if pad else "◀"
 	if _spec_next_btn:
@@ -3156,6 +3271,8 @@ func _on_spec_toggle_pressed() -> void:
 		_spec_mode = SPEC_MODE_THIRD
 	else:
 		_spec_snap_head = true  # jump straight onto the head, don't glide in from third/free
+		_spec_look_yaw = 0.0    # start facing their forward
+		_spec_look_pitch = 0.0
 		_spec_mode = SPEC_MODE_FPV  # from third OR free-fly, the toggle goes to FPV
 	_spec_refresh_buttons()
 
@@ -3308,14 +3425,25 @@ func _input(event: InputEvent) -> void:
 	elif event is InputEventMouseMotion or event is InputEventMouseButton or event is InputEventKey:
 		_last_input_was_pad = false
 
+	# F5 toggles the free cam on/off while spectating (keyboard shortcut).
+	if _spec_engaged and event is InputEventKey:
+		var ke := event as InputEventKey
+		if ke.pressed and not ke.echo and ke.keycode == KEY_F5:
+			_on_spec_freefly_pressed()
+			return
+
 	if _lobby_cam_override_active and event is InputEventMouseMotion and _lobby_look_held():
 		_lobby_mouse_rel += (event as InputEventMouseMotion).relative
 
-	# Free-fly look: while spectating in free-fly with the right mouse button held (mouse captured).
+	# Free-fly look: while spectating in free-fly (mouse captured).
 	if _spec_engaged and _spec_mode == SPEC_MODE_FREEFLY and _spec_grabbed_mouse and event is InputEventMouseMotion:
 		var mm := event as InputEventMouseMotion
 		_spec_freefly_yaw -= mm.relative.x * SPEC_FREEFLY_LOOK
 		_spec_freefly_pitch = clamp(_spec_freefly_pitch - mm.relative.y * SPEC_FREEFLY_LOOK, -1.4, 1.4)
+		return
+	# FPV-spectate self-look: accumulate mouse motion while Shift is held.
+	if _spec_engaged and _spec_mode == SPEC_MODE_FPV and Input.is_key_pressed(KEY_SHIFT) and event is InputEventMouseMotion:
+		_spec_look_rel += (event as InputEventMouseMotion).relative
 		return
 
 	if not enabled or _player == null or not is_instance_valid(_player):
