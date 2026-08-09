@@ -243,6 +243,19 @@ var _spec_next_btn: Button = null
 var _spec_spawn_pos: Vector3 = Vector3.ZERO   # local player's spawn point (free-fly start)
 var _spec_spawn_captured: bool = false
 var _spec_grabbed_mouse: bool = false         # we captured the mouse for free-fly RMB look
+
+# --- Mod-to-mod look networking (exact FPV look-around when the spectated player also has the mod) ---
+# The base game replicates body yaw + position but NOT the mod's independent head look. Mod peers
+# announce themselves (harmless no-op on non-mod peers) and then stream their look to each other
+# only; a spectated player without the mod simply has no data and gets the head-view fallback.
+const FPV_NET_BCAST_IV := 0.05   # 20 Hz look stream
+const FPV_NET_HELLO_IV := 3.0    # re-announce presence (also finds late joiners)
+const FPV_NET_STALE := 0.4       # look data older than this -> fall back to head-view
+var _net_time: float = 0.0
+var _net_bcast_accum: float = 0.0
+var _net_hello_accum: float = 0.0
+var _fpv_mod_peers: Dictionary = {}   # peer_id -> true (peers confirmed running this mod)
+var _fpv_looks: Dictionary = {}       # network_id -> {yaw, pitch, t} broadcast look
 var _gun_probe_last: String = ""  # last art-mesh name the crosshair probe reported (log only on change)
 var _gun_probe_accum: float = 0.0  # throttle timer for the crosshair probe
 
@@ -359,6 +372,11 @@ func _ready() -> void:
 
 	_create_crosshair()
 	_hook_settings_ui()
+
+	# Prune mod peers when they leave, so we never stream look data into the void.
+	var mp := multiplayer
+	if mp != null and not mp.peer_disconnected.is_connected(_fpv_on_peer_left):
+		mp.peer_disconnected.connect(_fpv_on_peer_left)
 
 
 
@@ -1796,6 +1814,8 @@ func _smooth_head_pos_toward(current: Vector3, target: Vector3, delta: float) ->
 
 func _process(delta: float) -> void:
 	_update_secret_level_floor(delta)
+	_net_time += delta
+	_fpv_net_broadcast(delta)  # self-gates: only streams while alive in a match with mod peers
 
 	if _process_lobby_fpv(delta):
 		return
@@ -2348,6 +2368,57 @@ func _end_death_cam() -> void:
 
 
 # =====================================================================================
+# Mod-to-mod look networking. Announce ourselves to peers; peers running the mod record each other
+# and stream their exact head look (yaw+pitch) only between themselves. A non-mod peer just logs a
+# harmless "unknown RPC target" for the low-rate hello and is never sent the look stream at all.
+# =====================================================================================
+
+@rpc("any_peer", "call_remote", "reliable")
+func _fpv_hello() -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	if sender <= 0:
+		return
+	var was_known: bool = _fpv_mod_peers.has(sender)
+	_fpv_mod_peers[sender] = true
+	if not was_known:
+		_fpv_hello.rpc_id(sender)  # reply so discovery is mutual immediately
+
+
+@rpc("any_peer", "call_remote", "unreliable_ordered")
+func _fpv_recv_look(nid: int, yaw: float, pitch: float) -> void:
+	_fpv_looks[nid] = {"yaw": yaw, "pitch": pitch, "t": _net_time}
+
+
+func _fpv_on_peer_left(pid: int) -> void:
+	_fpv_mod_peers.erase(pid)
+
+
+func _fpv_net_broadcast(delta: float) -> void:
+	if multiplayer == null or not multiplayer.has_multiplayer_peer():
+		return
+	# Announce periodically (finds late joiners too). Only mod peers have the node to receive it.
+	_net_hello_accum += delta
+	if _net_hello_accum >= FPV_NET_HELLO_IV:
+		_net_hello_accum = 0.0
+		_fpv_hello.rpc()
+	# Stream our look to known mod peers only -- but only when we're actually in first person.
+	if _fpv_mod_peers.is_empty():
+		return
+	if not enabled or _camera == null or not is_instance_valid(_camera) or _camera.get_parent() == null:
+		return
+	if _player == null or not is_instance_valid(_player) or not _player_is_active():
+		return
+	_net_bcast_accum += delta
+	if _net_bcast_accum < FPV_NET_BCAST_IV:
+		return
+	_net_bcast_accum = 0.0
+	var nid := multiplayer.get_unique_id()
+	var rot: Vector3 = _camera.global_rotation
+	for pid in _fpv_mod_peers.keys():
+		_fpv_recv_look.rpc_id(int(pid), nid, rot.y, rot.x)
+
+
+# =====================================================================================
 # Spectator system -- engages ONLY once the mod has handed to spectate (`_spectating_released`).
 # Three view modes over the living players: third-person (default), FPV (their view), and a
 # no-clip free-fly cam. Fully client-side and read-only; it never touches live play. Works the
@@ -2746,6 +2817,16 @@ func _spec_update_fpv() -> void:
 		var oc = t.get("camera")
 		if oc is Camera3D and is_instance_valid(oc) and oc != _spec_cam:
 			_spec_cam.global_transform = (oc as Camera3D).global_transform
+			return
+	# If the spectated player also runs the mod, use their exact streamed head look (yaw+pitch).
+	var nid := _spec_id_of(t)
+	if nid != 0 and _fpv_looks.has(nid):
+		var d = _fpv_looks[nid]
+		if _net_time - float(d["t"]) < FPV_NET_STALE:
+			var lyaw := float(d["yaw"])
+			var lfwd := Vector3(-sin(lyaw), 0.0, -cos(lyaw))
+			_spec_cam.global_position = _spec_head_origin(t) + lfwd * 0.05 + Vector3(0.0, 0.02, 0.0)
+			_spec_cam.global_rotation = Vector3(float(d["pitch"]), lyaw, 0.0)
 			return
 	# Fallback (matches a non-modded player's view): sit at their head, face their body direction.
 	var head := _spec_head_origin(t)
