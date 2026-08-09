@@ -260,6 +260,8 @@ var _spec_look_rel: Vector2 = Vector2.ZERO    # mouse motion accumulated while S
 var _spec_end_accum: float = 0.0              # hysteresis: a 1-frame blip can't end spectate/free-cam
 var _spec_shared_dist: float = 12.0           # shared-camera games: base cam distance (captured once)
 var _spec_shared_captured: bool = false
+var _stay_fpv_active: bool = false            # inactive-but-not-dead FPV (finished/between-rounds): allow look
+var _was_infected: bool = false               # edge-detect the stab to flash the infection overlay once
 
 # --- Mod-to-mod look networking (exact FPV look-around when the spectated player also has the mod) ---
 # The base game replicates body yaw + position but NOT the mod's independent head look. Mod peers
@@ -1456,12 +1458,20 @@ func _update_damage_flash(delta: float) -> void:
 func _update_infection_flash() -> void:
 	if _player == null or not is_instance_valid(_player):
 		return
-	var infected: bool = "is_infected" in _player and bool(_player.get("is_infected"))
-	# Hold the green overlay the WHOLE time you're infected/mutated (is_infected flips the moment you're
-	# stabbed/infected and stays true), not just during the transformation window. Re-set each frame so
-	# it's persistent; when it clears, the decay fades it out.
+	# ONLY the actually-mutated player, never the syringe carrier. The game sets is_infected true both
+	# when you're stabbed (infected_rpc) AND for whoever holds the syringe (set_has_item_rpc), so we
+	# exclude the holder via is_holding_syringe. is_infected latches at the stab and never reverts.
+	var infected: bool = ("is_infected" in _player and bool(_player.get("is_infected"))) \
+		and not ("is_holding_syringe" in _player and bool(_player.get("is_holding_syringe")))
+	# Behaves like the blood overlay: a hard flash + shake the instant you're stabbed, then a steady
+	# green tint the whole time you stay infected. The decay in _update_damage_flash settles the spike
+	# down to the floor. It clears at game end because the death path zeroes the rect.
+	if infected and not _was_infected:
+		_damage_flash_alpha = DAMAGE_FLASH_PEAK_ALPHA
+		_damage_shake_magnitude = DAMAGE_SHAKE_MAGNITUDE
+	_was_infected = infected
 	if infected:
-		_damage_flash_alpha = INFECTION_FLASH_ALPHA
+		_damage_flash_alpha = maxf(_damage_flash_alpha, INFECTION_FLASH_ALPHA)
 
 
 func _update_one_life_overlay(delta: float) -> void:
@@ -1867,6 +1877,7 @@ func _process(delta: float) -> void:
 	var have_rig := (_player != null and is_instance_valid(_player)
 		and _skeleton != null and is_instance_valid(_skeleton) and _head_bone_idx >= 0)
 	var active := have_rig and _player_is_active()
+	_stay_fpv_active = false  # recomputed below; only the finished/between-rounds branch turns it on
 
 	# Forklift has three distinct inactive states, handled in priority order:
 	if have_rig and _player_class_name == &"ForkliftCertifiedVehicle":
@@ -1921,12 +1932,11 @@ func _process(delta: float) -> void:
 		return
 
 	if not active:
-		# Recycle: at round end EVERY player (survivors and the soon-to-be-crushed loser) is set
-		# inactive while the game ranks scores, pans to the loser's seat, and picks who dies. None of
-		# that is death, so stay in first person through the whole ranking/pick window -- only the
-		# player's OWN is_dead flip (the actual crush) ends it. Isolated to Recycle.
-		if (_is_player_class(&"BurnRecyclePlayer") and _ever_active
-				and not ("is_dead" in _player and bool(_player.get("is_dead")))):
+		# FINISHED-BUT-ALIVE / between-rounds: only real death (or leaving) should spectate you. If you
+		# just finished your food (green pea), your smoke, etc., or you're a Recycle survivor waiting
+		# through the score/loser-pick, stay in first person AND let yourself look around.
+		if _ever_active and _finished_stay_fpv():
+			_stay_fpv_active = true
 			_update_mouse_capture()
 			_render_head_cam(delta, false)
 			return
@@ -2607,7 +2617,11 @@ func _update_spectate(delta: float) -> bool:
 	var mg_gone: bool = _spec_mg == null or not is_instance_valid(_spec_mg) or not _spec_mg.is_inside_tree()
 	var alive_again: bool = _player != null and is_instance_valid(_player) and _player_is_active() \
 		and not ("is_alive" in _player and not bool(_player.get("is_alive")))
-	if mg_gone or alive_again:
+	# Duck Hunt: the round is over the instant the game clears is_spectating (all ducks done -> new
+	# hunter/round). Spectating ends right there.
+	var dh_over: bool = not mg_gone and "is_spectating" in _spec_mg and "spectate_duck_players" in _spec_mg \
+		and not bool(_spec_mg.get("is_spectating"))
+	if mg_gone or alive_again or dh_over:
 		_spec_end_accum += delta
 		if _spec_end_accum >= 0.3:
 			_spectating_released = false
@@ -2640,9 +2654,18 @@ func _update_spectate(delta: float) -> bool:
 	else:
 		_spec_update_third()
 
+	_spec_clear_overlays()  # keep the damage/infection flash off the whole time we're spectating
 	_spec_update_ui()
 	_spec_update_mouse()
 	return true
+
+
+func _spec_clear_overlays() -> void:
+	_damage_flash_alpha = 0.0
+	_damage_shake_magnitude = 0.0
+	_was_infected = false
+	if _damage_flash_rect and is_instance_valid(_damage_flash_rect):
+		_damage_flash_rect.color = Color(DAMAGE_FLASH_COLOR.r, DAMAGE_FLASH_COLOR.g, DAMAGE_FLASH_COLOR.b, 0.0)
 
 
 func _spectate_engage() -> void:
@@ -2655,6 +2678,7 @@ func _spectate_engage() -> void:
 	_spec_look_yaw = 0.0
 	_spec_look_pitch = 0.0
 	_spec_shared_captured = false
+	_spec_clear_overlays()        # no leftover red/green damage flash while spectating (esp. the hunter)
 	_spec_mg = _spec_minigame()   # capture the minigame node -- lifecycle no longer depends on _player
 	_spec_build_targets()
 	_spec_pick_target()
@@ -2751,13 +2775,13 @@ func _spec_build_targets() -> void:
 	for p in players:
 		if _spec_is_alive(p):
 			alive.append(p)
-	# The Duck Hunt hunter is a first-person gun rig (no "head" bone), so the skeleton walk above
-	# never finds it. Pull it straight off the minigame so it's part of the cycle. Its aim/scope
-	# camera is replicated to every client, so FPV of the hunter is exact with no mod on their end.
-	if "hunter_player" in mg:
-		var hp = mg.get("hunter_player")
-		if hp != null and is_instance_valid(hp) and not (hp in alive):
-			alive.append(hp)
+	# The Duck Hunt hunter is a first-person gun rig (no "head" bone), so the skeleton walk never finds
+	# it. Find the hunter NODE by class in the minigame subtree -- NOT via `mg.hunter_player`, which is
+	# server-only and null on clients (that's why hunter-spectate barely worked for clients). Its aim
+	# camera is always-replicated, so its view is exact on every peer.
+	var hunter := _spec_find_hunter(mg)
+	if hunter != null and not (hunter in alive):
+		alive.append(hunter)
 	alive.sort_custom(_spec_sort_by_id)
 	_spec_targets = alive
 
@@ -2772,6 +2796,27 @@ func _spec_collect_head_skeletons(n: Node, out: Array, budget: Array) -> void:
 			out.append(sk)
 	for c in n.get_children():
 		_spec_collect_head_skeletons(c, out, budget)
+
+
+func _spec_find_hunter(mg: Node) -> Node:
+	# Client-safe: locate the DuckHuntHunterPlayer node by class anywhere under the minigame.
+	return _spec_find_by_class(mg, "DuckHunt", "Hunter", [SCAN_BUDGET])
+
+
+func _spec_find_by_class(n: Node, must_a: String, must_b: String, budget: Array) -> Node:
+	if budget[0] <= 0:
+		return null
+	budget[0] -= 1
+	var sc: Script = n.get_script()
+	if sc != null:
+		var cn: String = String(sc.get_global_name())
+		if cn.contains(must_a) and cn.contains(must_b):
+			return n
+	for c in n.get_children():
+		var f := _spec_find_by_class(c, must_a, must_b, budget)
+		if f != null:
+			return f
+	return null
 
 
 func _spec_player_of_skeleton(sk: Node) -> Node:
@@ -3479,8 +3524,8 @@ func _input(event: InputEvent) -> void:
 
 	if not enabled or _player == null or not is_instance_valid(_player):
 		return
-	if not _player_is_active() and _ever_active and not _dying:
-		return
+	if not _player_is_active() and _ever_active and not _dying and not _stay_fpv_active:
+		return  # allow look-around while finished/between-rounds (stay-FPV)
 	if _dying:
 		return
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
@@ -3509,8 +3554,8 @@ func _current_yaw_limit_rad() -> float:
 func _apply_controller_look(delta: float) -> void:
 	if _player == null or not is_instance_valid(_player):
 		return
-	if not _player_is_active() and _ever_active and not _dying:
-		return
+	if not _player_is_active() and _ever_active and not _dying and not _stay_fpv_active:
+		return  # allow look-around while finished/between-rounds (stay-FPV)
 	if _dying:
 		return
 
@@ -3554,6 +3599,23 @@ func _player_is_active() -> bool:
 	if "active" in _player:
 		return bool(_player.get("active"))
 	return true
+
+
+func _finished_stay_fpv() -> bool:
+	# True when the local player is inactive but NOT dead -- they finished their task (green pea food,
+	# smoke break, a build, ...) or they're a Recycle survivor between rounds. Those must stay in first
+	# person with look-around, never spectate. Only real death / leaving the game spectates.
+	if _player == null or not is_instance_valid(_player):
+		return false
+	if "is_dead" in _player and bool(_player.get("is_dead")):
+		return false
+	if "finished" in _player and bool(_player.get("finished")):
+		return true
+	if "is_finished" in _player and bool(_player.get("is_finished")):
+		return true
+	if _is_player_class(&"BurnRecyclePlayer"):
+		return true  # survivor through the score/loser-pick (is_dead flips only on the actual crush)
+	return false
 
 
 func _rotate_player_movement() -> void:
