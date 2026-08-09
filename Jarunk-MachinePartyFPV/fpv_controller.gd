@@ -2608,6 +2608,13 @@ func _spec_build_targets() -> void:
 	for p in players:
 		if _spec_is_alive(p):
 			alive.append(p)
+	# The Duck Hunt hunter is a first-person gun rig (no "head" bone), so the skeleton walk above
+	# never finds it. Pull it straight off the minigame so it's part of the cycle. Its aim/scope
+	# camera is replicated to every client, so FPV of the hunter is exact with no mod on their end.
+	if "hunter_player" in mg:
+		var hp = mg.get("hunter_player")
+		if hp != null and is_instance_valid(hp) and not (hp in alive):
+			alive.append(hp)
 	alive.sort_custom(_spec_sort_by_id)
 	_spec_targets = alive
 
@@ -2649,12 +2656,21 @@ func _spec_sort_by_id(a: Node, b: Node) -> bool:
 
 
 func _spec_is_alive(p: Node) -> bool:
+	# Player state is per-minigame; there is no universal flag. Check the explicit death flags
+	# first, then `active` (present on nearly every player subclass and RPC-synced to all clients
+	# when the round is playing), then life/health counters.
 	if p == null or not is_instance_valid(p):
 		return false
 	if "is_dead" in p and bool(p.get("is_dead")):
 		return false
+	if "dead" in p and bool(p.get("dead")):
+		return false
 	if "is_alive" in p:
 		return bool(p.get("is_alive"))
+	if "alive" in p:
+		return bool(p.get("alive"))
+	if "active" in p:
+		return bool(p.get("active"))
 	if "lives" in p:
 		return int(p.get("lives")) > 0
 	if "health" in p:
