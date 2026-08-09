@@ -50,6 +50,7 @@ const SMOKE_SHAKE_START := 0.35       # drag_progress below this = no shake (a c
 const SMOKE_SHAKE_MAX := 0.085        # world units, peak jitter as drag_progress approaches 1.0
 
 const ONE_LIFE_OVERLAY_COLOR := Color(0.6, 0.0, 0.0)
+const INFECTION_OVERLAY_COLOR := Color(0.18, 0.66, 0.32)  # green twin of the blood vignette (Inside Job)
 const ONE_LIFE_OVERLAY_MIN_ALPHA := 0.30
 const ONE_LIFE_OVERLAY_MAX_ALPHA := 0.55
 const ONE_LIFE_OVERLAY_PULSE_SPEED := 2.6  # radians/sec into the sine driving the pulse
@@ -225,6 +226,7 @@ const SPEC_FREEFLY_SPEED := 16.0    # base free-fly move speed (units/sec)
 const SPEC_FREEFLY_LOOK := 0.0035   # free-fly mouse look sensitivity (rad/pixel)
 const SPEC_FREEFLY_PAD_LOOK := 2.8  # free-fly controller right-stick look (rad/sec at full tilt)
 const SPEC_PAD_MOVE_DEADZONE := 0.18
+const SPEC_HEAD_SMOOTHING := 20.0   # FPV-spectate head follow rate (tight but de-jittered)
 var _spec_engaged: bool = false     # my spectate system is active (I'm dead + spectating a live round)
 var _spec_mode: int = SPEC_MODE_THIRD  # third-person is the default
 var _spec_cam: Camera3D = null      # my own spectator camera (created on engage, freed on disengage)
@@ -242,6 +244,7 @@ var _spec_name_label: Label = null
 var _spec_role_label: Label = null
 var _spec_prev_btn: Button = null
 var _spec_next_btn: Button = null
+var _spec_look_hint: Label = null     # "hold Shift / LB to look around" shown in FPV-spectate
 var _spec_spawn_pos: Vector3 = Vector3.ZERO   # local player's spawn point (free-fly start)
 var _spec_spawn_captured: bool = false
 var _spec_grabbed_mouse: bool = false         # we captured the mouse for free-fly look
@@ -262,6 +265,7 @@ var _spec_shared_dist: float = 12.0           # shared-camera games: base cam di
 var _spec_shared_captured: bool = false
 var _stay_fpv_active: bool = false            # inactive-but-not-dead FPV (finished/between-rounds): allow look
 var _was_infected: bool = false               # edge-detect the stab to flash the infection overlay once
+var _spec_hunter_ref: Node = null             # Duck Hunt hunter whose laser/scope we've locally tweaked
 
 # --- Mod-to-mod look networking (exact FPV look-around when the spectated player also has the mod) ---
 # The base game replicates body yaw + position but NOT the mod's independent head look. Mod peers
@@ -1463,22 +1467,29 @@ func _update_infection_flash() -> void:
 	# exclude the holder via is_holding_syringe. is_infected latches at the stab and never reverts.
 	var infected: bool = ("is_infected" in _player and bool(_player.get("is_infected"))) \
 		and not ("is_holding_syringe" in _player and bool(_player.get("is_holding_syringe")))
-	# Behaves like the blood overlay: a hard flash + shake the instant you're stabbed, then a steady
-	# green tint the whole time you stay infected. The decay in _update_damage_flash settles the spike
-	# down to the floor. It clears at game end because the death path zeroes the rect.
+	# 1:1 with the blood overlay, just green: the flash+shake fires the instant you're stabbed (exactly
+	# like taking a hit) and then decays; the ongoing green is the pulsing vignette (see the one-life
+	# overlay), so we do NOT hold a flat tint here anymore.
 	if infected and not _was_infected:
 		_damage_flash_alpha = DAMAGE_FLASH_PEAK_ALPHA
 		_damage_shake_magnitude = DAMAGE_SHAKE_MAGNITUDE
 	_was_infected = infected
-	if infected:
-		_damage_flash_alpha = maxf(_damage_flash_alpha, INFECTION_FLASH_ALPHA)
 
 
 func _update_one_life_overlay(delta: float) -> void:
-	var show: bool = (_damage_flash_property != "" and _damage_flash_last_value == 1)
+	# The pulsing vignette IS the blood overlay. Infection reuses it verbatim, only green: while you're
+	# the mutated player (not the syringe carrier) it pulses green; at one life it pulses red.
+	var infected: bool = _player_class_name == INFECTION_FLASH_CLASS \
+		and _player != null and is_instance_valid(_player) \
+		and ("is_infected" in _player and bool(_player.get("is_infected"))) \
+		and not ("is_holding_syringe" in _player and bool(_player.get("is_holding_syringe")))
+	var one_life: bool = _damage_flash_property != "" and _damage_flash_last_value == 1
+	var show: bool = infected or one_life
 	_one_life_overlay.visible = show
 	if not show:
 		return
+	var vcol: Color = INFECTION_OVERLAY_COLOR if infected else ONE_LIFE_OVERLAY_COLOR
+	_one_life_overlay_material.set_shader_parameter("vignette_color", vcol)
 	_one_life_pulse_time += delta * ONE_LIFE_OVERLAY_PULSE_SPEED
 	var t: float = (sin(_one_life_pulse_time) + 1.0) * 0.5  # 0..1
 	var alpha: float = lerp(ONE_LIFE_OVERLAY_MIN_ALPHA, ONE_LIFE_OVERLAY_MAX_ALPHA, t)
@@ -2008,8 +2019,9 @@ func _render_head_cam(delta: float, active: bool) -> void:
 	if active and _movement_rotate_active:
 		_rotate_player_movement()
 
+	if active or _stay_fpv_active:
+		_update_damage_flash(delta)  # keep the infection/damage overlay alive through the transform/finish
 	if active:
-		_update_damage_flash(delta)
 		_update_collar_indicator()
 		_update_smoke_break_hud()
 		_update_round_timer()
@@ -2570,6 +2582,28 @@ func _create_spectate_ui() -> void:
 	_spec_role_label.add_theme_color_override("font_color", Color(0.85, 0.85, 0.85))
 	_spec_name_panel.add_child(_spec_role_label)
 
+	# FPV-spectate look hint (just above the name panel).
+	_spec_look_hint = Label.new()
+	_spec_look_hint.name = "FpvSpecLookHint"
+	_spec_look_hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_spec_look_hint.anchor_left = 0.5
+	_spec_look_hint.anchor_right = 0.5
+	_spec_look_hint.anchor_top = 1.0
+	_spec_look_hint.anchor_bottom = 1.0
+	_spec_look_hint.offset_left = -170
+	_spec_look_hint.offset_right = 170
+	_spec_look_hint.offset_top = -104
+	_spec_look_hint.offset_bottom = -82
+	_spec_look_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_spec_look_hint.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	if _spec_font:
+		_spec_look_hint.add_theme_font_override("font", _spec_font)
+	_spec_look_hint.add_theme_font_size_override("font_size", 13)
+	_spec_look_hint.add_theme_color_override("font_color", Color(0.72, 0.72, 0.75))
+	_spec_look_hint.text = "hold Shift / LB to look around"
+	_spec_look_hint.visible = false
+	_crosshair_layer.add_child(_spec_look_hint)
+
 
 func _style_native_button(btn: Button) -> void:
 	if _spec_font:
@@ -2666,6 +2700,8 @@ func _spec_clear_overlays() -> void:
 	_was_infected = false
 	if _damage_flash_rect and is_instance_valid(_damage_flash_rect):
 		_damage_flash_rect.color = Color(DAMAGE_FLASH_COLOR.r, DAMAGE_FLASH_COLOR.g, DAMAGE_FLASH_COLOR.b, 0.0)
+	if _one_life_overlay and is_instance_valid(_one_life_overlay):
+		_one_life_overlay.visible = false
 
 
 func _spectate_engage() -> void:
@@ -2725,6 +2761,9 @@ func _spectate_disengage() -> void:
 		_spec_freefly_btn.visible = false
 	if _spec_name_panel:
 		_spec_name_panel.visible = false
+	if _spec_look_hint:
+		_spec_look_hint.visible = false
+	_spec_hunter_restore()  # undo any hunter view tweaks (laser/scope) we made
 	if not _spec_engaged:
 		return
 	_spec_engaged = false
@@ -2923,6 +2962,13 @@ func _spec_update_third() -> void:
 	# our arrows drive WHICH player it shows, and block the base game's click-to-switch.
 	_spec_restore_hidden_head()  # show their head again in 3rd person
 	var t := _spec_target
+
+	# Duck Hunt hunter: mirror their exact first-person view into our own camera (arms, gun, aim, scope).
+	if t != null and is_instance_valid(t) and _spec_role_for(t) == "HUNTER" and "camera" in t:
+		_spec_update_hunter(t)
+		return
+	_spec_hunter_restore()  # not on the hunter -> undo the laser/scope tweaks
+
 	if _spec_cam != null and is_instance_valid(_spec_cam) and _spec_cam.current:
 		_spec_cam.current = false
 
@@ -2967,6 +3013,54 @@ func _spec_update_third() -> void:
 		gcam = _find_fallback_camera()
 	if gcam != null and is_instance_valid(gcam) and not gcam.current:
 		gcam.current = true
+
+
+func _spec_update_hunter(t: Node) -> void:
+	# Everything the hunter sees: mirror their camera (renders their arms/gun -- they're world models on
+	# the default render layer), zoom our FOV when they scope, show the scope reticle, and HIDE the laser
+	# (they don't see their own). Aim (yaw/pitch) and laser-on state are network-replicated, so this is
+	# exact on any client. Zoom LEVEL isn't networked, so we infer scoped-or-not from the laser flag.
+	_spec_hunter_ref = t
+	var hcam = t.get("camera")
+	if not (hcam is Camera3D) or not is_instance_valid(hcam):
+		return
+	var hc := hcam as Camera3D
+	var scoped := _spec_hunter_scoped(hc)
+	_spec_cam.global_transform = hc.global_transform
+	_spec_cam.fov = 24.0 if scoped else 55.0
+	if not _spec_cam.current:
+		_spec_cam.current = true
+	# Hide the beam the hunter never sees. LaserParent.visible is NOT replicated, so this is local + safe.
+	var lp = hc.get_node_or_null("LaserParent")
+	if lp is Node3D:
+		(lp as Node3D).visible = false
+	# The scope reticle the hunter sees when zoomed (its own screen-space overlay, alpha-0 by default).
+	var reticle = t.get_node_or_null("HunterCanvasLayer/Control")
+	if reticle is CanvasItem:
+		(reticle as CanvasItem).modulate.a = 1.0 if scoped else 0.0
+
+
+func _spec_hunter_scoped(hc: Camera3D) -> bool:
+	# The laser is only visible while zoomed (zoom_fov_index > 0), and LaserOrigin:visible IS replicated.
+	var lo = hc.get_node_or_null("LaserParent/LaserOrigin")
+	if lo is Node3D:
+		return (lo as Node3D).visible
+	return false
+
+
+func _spec_hunter_restore() -> void:
+	if _spec_hunter_ref != null and is_instance_valid(_spec_hunter_ref):
+		var hcam = _spec_hunter_ref.get("camera") if "camera" in _spec_hunter_ref else null
+		if hcam is Camera3D and is_instance_valid(hcam):
+			var lp = (hcam as Camera3D).get_node_or_null("LaserParent")
+			if lp is Node3D:
+				(lp as Node3D).visible = true
+		var reticle = _spec_hunter_ref.get_node_or_null("HunterCanvasLayer/Control")
+		if reticle is CanvasItem:
+			(reticle as CanvasItem).modulate.a = 0.0
+	if _spec_cam != null and is_instance_valid(_spec_cam):
+		_spec_cam.fov = 55.0  # undo any zoom before other modes use our camera
+	_spec_hunter_ref = null
 
 
 func _spec_players_centroid() -> Vector3:
@@ -3014,13 +3108,12 @@ func _spec_update_fpv(delta: float) -> void:
 	var t := _spec_target
 	if t == null or not is_instance_valid(t):
 		return
-	# Duck Hunt hunter: exact networked scope cam (a gun rig, no humanoid head to pin to).
-	if _spec_use_owned_camera(t):
+	# Duck Hunt hunter: full first-person view (arms/gun/aim/scope, laser hidden). Not a head rig.
+	if _spec_role_for(t) == "HUNTER" and "camera" in t:
 		_spec_restore_hidden_head()
-		var oc = t.get("camera")
-		if oc is Camera3D and is_instance_valid(oc) and oc != _spec_cam:
-			_spec_cam.global_transform = (oc as Camera3D).global_transform
+		_spec_update_hunter(t)
 		return
+	_spec_hunter_restore()  # not the hunter -> undo any hunter tweaks
 	var sk := _first_skeleton_with_head(t, [SCAN_BUDGET])
 	if sk == null:
 		_spec_restore_hidden_head()
@@ -3054,13 +3147,16 @@ func _spec_apply_self_look(delta: float) -> void:
 	# controller right-stick always looks (it's free in FPV). Offsets clamped like the lobby view.
 	var yaw_limit: float = deg_to_rad(LOBBY_FPV_YAW_LIMIT_DEG)
 	var pitch_limit: float = deg_to_rad(LOBBY_FPV_PITCH_LIMIT_DEG)
+	# Match real-FPV sensitivity (and the player's slider) so it feels native, not fast.
 	if Input.is_key_pressed(KEY_SHIFT):
-		_spec_look_yaw -= _spec_look_rel.x * LOBBY_FPV_MOUSE_SENS
-		_spec_look_pitch -= _spec_look_rel.y * LOBBY_FPV_MOUSE_SENS
+		var sens: float = MOUSE_SENSITIVITY * _mouse_sensitivity_mult
+		_spec_look_yaw -= _spec_look_rel.x * sens
+		_spec_look_pitch -= _spec_look_rel.y * sens
 	var stick := _lobby_stick_vector()  # right stick, deadzoned
 	if stick != Vector2.ZERO:
-		_spec_look_yaw -= stick.x * LOBBY_FPV_STICK_SPEED * delta
-		_spec_look_pitch -= stick.y * LOBBY_FPV_STICK_SPEED * delta
+		var cstep: float = CONTROLLER_LOOK_SPEED * _controller_sensitivity_mult * delta
+		_spec_look_yaw -= stick.x * cstep
+		_spec_look_pitch -= stick.y * cstep
 	_spec_look_yaw = clampf(_spec_look_yaw, -yaw_limit, yaw_limit)
 	_spec_look_pitch = clampf(_spec_look_pitch, -pitch_limit, pitch_limit)
 	_spec_look_rel = Vector2.ZERO
@@ -3073,12 +3169,12 @@ func _spec_eye_offset(yaw: float) -> Vector3:
 	return forward * _eye_forward_offset + Vector3.UP * _eye_up_offset + left * _eye_left_offset
 
 
-func _spec_smooth_head_toward(current: Vector3, target: Vector3, delta: float, yaw: float) -> Vector3:
-	var forward: Vector3 = Basis(Vector3.UP, yaw) * Vector3(0, 0, -1)
-	var right: Vector3 = Basis(Vector3.UP, yaw) * Vector3(1, 0, 0)
-	var d: Vector3 = target - current
-	var w: float = 1.0 - exp(-delta * HEAD_BOB_SMOOTHING)
-	return current + Vector3.UP * (d.y * w) + right * (d.dot(right) * w) + forward * d.dot(forward)
+func _spec_smooth_head_toward(current: Vector3, target: Vector3, delta: float, _yaw: float) -> Vector3:
+	# Smooth ALL axes (unlike our own FPV, which snaps forward). The spectated head comes off a
+	# network-interpolated remote body, so full smoothing removes the jitter; a tight rate keeps it
+	# feeling responsive/native rather than floaty.
+	var w: float = 1.0 - exp(-delta * SPEC_HEAD_SMOOTHING)
+	return current.lerp(target, w)
 
 
 func _spec_hide_head(sk: Skeleton3D, idx: int) -> void:
@@ -3107,6 +3203,7 @@ func _spec_use_owned_camera(t: Node) -> bool:
 
 func _spec_update_freefly(delta: float) -> void:
 	_spec_restore_hidden_head()  # free-fly is decoupled from the spectated player
+	_spec_hunter_restore()
 	var device := _spec_pad_device()
 
 	# Look-around is a HOLD (mouse look is handled via Shift-capture in _input): on a controller, hold
@@ -3227,6 +3324,8 @@ func _spec_update_ui() -> void:
 
 	var in_chisel := _spec_mg_is("chisel")
 	var on_hunter: bool = _spec_target != null and is_instance_valid(_spec_target) and _spec_role_for(_spec_target) == "HUNTER"
+	if _spec_look_hint:
+		_spec_look_hint.visible = _spec_mode == SPEC_MODE_FPV and not in_chisel and not on_hunter
 
 	# Duck Hunt hunter: no FPV toggle -- its 3rd-person view already IS its scope. Drop out of FPV if
 	# we cycled onto it while in FPV. Shows back the moment you cycle to someone else.
@@ -3609,12 +3708,16 @@ func _finished_stay_fpv() -> bool:
 		return false
 	if "is_dead" in _player and bool(_player.get("is_dead")):
 		return false
+	if "is_alive" in _player and not bool(_player.get("is_alive")):
+		return false  # a real kill (Inside Job kill_rpc) -> spectate
 	if "finished" in _player and bool(_player.get("finished")):
 		return true
 	if "is_finished" in _player and bool(_player.get("is_finished")):
 		return true
 	if _is_player_class(&"BurnRecyclePlayer"):
 		return true  # survivor through the score/loser-pick (is_dead flips only on the actual crush)
+	if _is_player_class(&"KnifeAtTheOfficePlayer"):
+		return true  # infection sets active=false for the 5s transform, but you're still playing -- stay FPV
 	return false
 
 
