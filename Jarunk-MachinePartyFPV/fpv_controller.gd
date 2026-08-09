@@ -223,6 +223,8 @@ const SPEC_MODE_FPV := 1
 const SPEC_MODE_FREEFLY := 2
 const SPEC_FREEFLY_SPEED := 16.0    # base free-fly move speed (units/sec)
 const SPEC_FREEFLY_LOOK := 0.0035   # free-fly mouse look sensitivity (rad/pixel)
+const SPEC_FREEFLY_PAD_LOOK := 2.8  # free-fly controller right-stick look (rad/sec at full tilt)
+const SPEC_PAD_MOVE_DEADZONE := 0.18
 var _spec_engaged: bool = false     # my spectate system is active (I'm dead + spectating a live round)
 var _spec_mode: int = SPEC_MODE_THIRD  # third-person is the default
 var _spec_cam: Camera3D = null      # my own spectator camera (created on engage, freed on disengage)
@@ -249,6 +251,7 @@ var _spec_snap_head: bool = false             # snap (don't glide) on target/mod
 var _spec_hidden_skel: Skeleton3D = null      # the spectated skeleton whose head we're hiding
 var _spec_hidden_idx: int = -1
 var _spec_hidden_orig_scale: Vector3 = Vector3.ONE
+var _pad_edge: Dictionary = {}                # per-button held-state for controller edge detection
 
 # --- Mod-to-mod look networking (exact FPV look-around when the spectated player also has the mod) ---
 # The base game replicates body yaw + position but NOT the mod's independent head look. Mod peers
@@ -2602,6 +2605,8 @@ func _update_spectate(delta: float) -> bool:
 	if _spec_target == null or not is_instance_valid(_spec_target) or not _spec_is_alive(_spec_target):
 		_spec_pick_target()
 
+	_spec_controller_input()  # gamepad: cycle / toggle FPV / enter-exit free cam
+
 	# Third-person hands to the game's OWN spectator camera (exact vanilla view); FPV/free-fly use ours.
 	if _spec_mode == SPEC_MODE_FREEFLY:
 		if not _spec_cam.current:
@@ -2931,6 +2936,17 @@ func _spec_use_owned_camera(t: Node) -> bool:
 
 func _spec_update_freefly(delta: float) -> void:
 	_spec_restore_hidden_head()  # free-fly is decoupled from the spectated player
+	var device := _spec_pad_device()
+
+	# Controller right-stick look.
+	if device >= 0:
+		var lv := Vector2(Input.get_joy_axis(device, JOY_AXIS_RIGHT_X), Input.get_joy_axis(device, JOY_AXIS_RIGHT_Y))
+		var lm: float = lv.length()
+		if lm > CONTROLLER_LOOK_DEADZONE:
+			var ls: Vector2 = lv.normalized() * ((lm - CONTROLLER_LOOK_DEADZONE) / (1.0 - CONTROLLER_LOOK_DEADZONE))
+			_spec_freefly_yaw -= ls.x * SPEC_FREEFLY_PAD_LOOK * delta
+			_spec_freefly_pitch = clamp(_spec_freefly_pitch - ls.y * SPEC_FREEFLY_PAD_LOOK * delta, -1.4, 1.4)
+
 	var speed := SPEC_FREEFLY_SPEED
 	if Input.is_key_pressed(KEY_SHIFT):
 		speed *= 3.5
@@ -2948,6 +2964,21 @@ func _spec_update_freefly(delta: float) -> void:
 		dir += Vector3.UP
 	if Input.is_key_pressed(KEY_Q) or Input.is_key_pressed(KEY_CTRL):
 		dir -= Vector3.UP
+
+	# Controller left-stick move + triggers up/down (L3 click = sprint).
+	if device >= 0:
+		var mv := Vector2(Input.get_joy_axis(device, JOY_AXIS_LEFT_X), Input.get_joy_axis(device, JOY_AXIS_LEFT_Y))
+		if mv.length() > SPEC_PAD_MOVE_DEADZONE:
+			dir += basis.x * mv.x + basis.z * mv.y  # stick up (-Y) -> forward (-Z)
+		var rt := Input.get_joy_axis(device, JOY_AXIS_TRIGGER_RIGHT)
+		var lt := Input.get_joy_axis(device, JOY_AXIS_TRIGGER_LEFT)
+		if rt > 0.15:
+			dir += Vector3.UP * rt
+		if lt > 0.15:
+			dir -= Vector3.UP * lt
+		if Input.is_joy_button_pressed(device, JOY_BUTTON_LEFT_STICK):
+			speed *= 3.5
+
 	if dir.length() > 0.001:
 		_spec_freefly_pos += dir.normalized() * speed * delta
 	_spec_cam.global_transform = Transform3D(basis, _spec_freefly_pos)
@@ -2955,11 +2986,11 @@ func _spec_update_freefly(delta: float) -> void:
 
 func _spec_update_mouse() -> void:
 	# Free-fly = full mouselook with a captured cursor (no button to hold, clicks can't exit it). Hold
-	# Left Alt (or open pause) to reveal the cursor so you can click "Exit Free Cam". Every other mode
-	# keeps the cursor free so the on-screen buttons are clickable.
+	# Left Alt (or open pause) to reveal the cursor so you can click "Exit Free Cam". On a controller we
+	# never grab the cursor (the sticks handle look). Every other mode keeps the cursor free for the UI.
 	var pause_menu := get_node_or_null("/root/PauseMenu")
 	var paused: bool = pause_menu != null and bool(pause_menu.get("active"))
-	var want_capture: bool = _spec_mode == SPEC_MODE_FREEFLY and not paused and not Input.is_key_pressed(KEY_ALT)
+	var want_capture: bool = _spec_mode == SPEC_MODE_FREEFLY and not paused and not _using_controller() and not Input.is_key_pressed(KEY_ALT)
 	if want_capture:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -2968,6 +2999,52 @@ func _spec_update_mouse() -> void:
 		if _spec_grabbed_mouse and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 		_spec_grabbed_mouse = false
+
+
+func _using_controller() -> bool:
+	var gm := get_node_or_null("/root/GameManager")
+	return gm != null and gm.has_method("is_using_controller") and bool(gm.call("is_using_controller"))
+
+
+func _spec_pad_device() -> int:
+	var d := _look_joypad_device()
+	if d >= 0:
+		return d
+	var pads := Input.get_connected_joypads()
+	if pads.is_empty():
+		return -1
+	return int(pads[0])
+
+
+func _pad_just_pressed(device: int, button: int) -> bool:
+	var down := Input.is_joy_button_pressed(device, button)
+	var was: bool = bool(_pad_edge.get(button, false))
+	_pad_edge[button] = down
+	return down and not was
+
+
+func _spec_controller_input() -> void:
+	# Controller map while spectating: LB/RB or D-pad L/R = cycle players; Y = FPV<->third;
+	# X = enter/exit free cam. Free-cam movement/look is read in _spec_update_freefly.
+	var device := _spec_pad_device()
+	if device < 0:
+		_pad_edge.clear()
+		return
+	var lb := _pad_just_pressed(device, JOY_BUTTON_LEFT_SHOULDER)
+	var rb := _pad_just_pressed(device, JOY_BUTTON_RIGHT_SHOULDER)
+	var dpl := _pad_just_pressed(device, JOY_BUTTON_DPAD_LEFT)
+	var dpr := _pad_just_pressed(device, JOY_BUTTON_DPAD_RIGHT)
+	var y := _pad_just_pressed(device, JOY_BUTTON_Y)
+	var x := _pad_just_pressed(device, JOY_BUTTON_X)
+	if _spec_mode != SPEC_MODE_FREEFLY:
+		if lb or dpl:
+			_spec_cycle(-1)
+		if rb or dpr:
+			_spec_cycle(1)
+	if y:
+		_on_spec_toggle_pressed()
+	if x:
+		_on_spec_freefly_pressed()
 
 
 func _spec_update_ui() -> void:
