@@ -2677,60 +2677,6 @@ func _spectate_disengage() -> void:
 	print("[fpv_mod] spectate disengaged")
 
 
-func _spectate_engage() -> void:
-	_spec_engaged = true
-	_spec_mode = SPEC_MODE_THIRD
-	_spec_grabbed_mouse = false
-	_spec_rebuild_accum = 0.0
-	_spec_build_targets()
-	_spec_pick_target()
-
-	_spec_cam = Camera3D.new()
-	_spec_cam.name = "FpvSpectatorCamera"
-	get_tree().root.add_child(_spec_cam)
-	# NOT made current here -- the default third-person mode hands to the game's own camera.
-
-	if _spec_spawn_captured:
-		_spec_freefly_pos = _spec_spawn_pos
-	elif _spec_target and is_instance_valid(_spec_target) and _spec_target is Node3D:
-		_spec_freefly_pos = (_spec_target as Node3D).global_position + Vector3(0, 2.0, 0)
-	_spec_freefly_yaw = 0.0
-	_spec_freefly_pitch = -0.12
-
-	if _spec_toggle_btn:
-		_spec_toggle_btn.visible = true
-	if _spec_freefly_btn:
-		_spec_freefly_btn.visible = true
-	if _spec_name_panel:
-		_spec_name_panel.visible = true
-	_spec_refresh_buttons()
-	print("[fpv_mod] spectate engaged (", _spec_targets.size(), " living targets)")
-
-
-func _spectate_disengage() -> void:
-	if _spec_grabbed_mouse and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
-	_spec_grabbed_mouse = false
-	if _spec_cam and is_instance_valid(_spec_cam):
-		_spec_cam.current = false
-		if _spec_cam.get_parent() != null:
-			_spec_cam.get_parent().remove_child(_spec_cam)
-		_spec_cam.queue_free()
-	_spec_cam = null
-	_spec_target = null
-	_spec_targets.clear()
-	if _spec_toggle_btn:
-		_spec_toggle_btn.visible = false
-	if _spec_freefly_btn:
-		_spec_freefly_btn.visible = false
-	if _spec_name_panel:
-		_spec_name_panel.visible = false
-	if not _spec_engaged:
-		return
-	_spec_engaged = false
-	print("[fpv_mod] spectate disengaged")
-
-
 func _spec_minigame() -> Node:
 	if _player == null or not is_instance_valid(_player):
 		return null
