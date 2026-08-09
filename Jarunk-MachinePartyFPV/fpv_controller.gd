@@ -252,6 +252,8 @@ var _spec_hidden_skel: Skeleton3D = null      # the spectated skeleton whose hea
 var _spec_hidden_idx: int = -1
 var _spec_hidden_orig_scale: Vector3 = Vector3.ONE
 var _pad_edge: Dictionary = {}                # per-button held-state for controller edge detection
+var _last_input_was_pad: bool = false         # live input-device detection (drives UI button hints)
+var _spec_pad_ui_state: int = -1              # cached pad/mouse state the spectate labels reflect
 
 # --- Mod-to-mod look networking (exact FPV look-around when the spectated player also has the mod) ---
 # The base game replicates body yaw + position but NOT the mod's independent head look. Mod peers
@@ -2835,18 +2837,20 @@ func _spec_body_yaw(t: Node) -> float:
 
 
 func _spec_update_third() -> void:
-	# The default view is the game's OWN 3rd-person spectator/overview camera -- the exact vanilla
-	# view a dead player sees. We just re-assert it as current and release ours; never a custom orbit.
+	# Our OWN follow-cam behind the selected player. This is what makes the cycle arrows actually change
+	# who you watch -- and it means the base game's click-to-switch-player can't affect what you see,
+	# because our camera (not the game's spectator cam) is always the one on screen.
 	_spec_restore_hidden_head()  # show their head again in 3rd person
-	if _spec_cam != null and is_instance_valid(_spec_cam) and _spec_cam.current:
-		_spec_cam.current = false
-	var gcam := _find_game_camera(true)
-	if gcam == null and _orig_camera != null and is_instance_valid(_orig_camera):
-		gcam = _orig_camera
-	if gcam == null:
-		gcam = _find_fallback_camera()
-	if gcam != null and is_instance_valid(gcam) and not gcam.current:
-		gcam.current = true
+	var t := _spec_target
+	if t == null or not is_instance_valid(t) or not (t is Node3D):
+		return
+	if not _spec_cam.current:
+		_spec_cam.current = true
+	var head := _spec_head_origin(t)
+	var yaw := _spec_body_yaw(t)
+	var fwd := Vector3(-sin(yaw), 0.0, -cos(yaw))  # the way the body faces
+	_spec_cam.global_position = head - fwd * 3.2 + Vector3(0.0, 1.0, 0.0)  # behind + above
+	_spec_cam.look_at(head + Vector3(0.0, 0.1, 0.0), Vector3.UP)
 
 
 func _spec_update_fpv(delta: float) -> void:
@@ -2990,7 +2994,7 @@ func _spec_update_mouse() -> void:
 	# never grab the cursor (the sticks handle look). Every other mode keeps the cursor free for the UI.
 	var pause_menu := get_node_or_null("/root/PauseMenu")
 	var paused: bool = pause_menu != null and bool(pause_menu.get("active"))
-	var want_capture: bool = _spec_mode == SPEC_MODE_FREEFLY and not paused and not _using_controller() and not Input.is_key_pressed(KEY_ALT)
+	var want_capture: bool = _spec_mode == SPEC_MODE_FREEFLY and not paused and not _last_input_was_pad and not Input.is_key_pressed(KEY_ALT)
 	if want_capture:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -3048,6 +3052,11 @@ func _spec_controller_input() -> void:
 
 
 func _spec_update_ui() -> void:
+	# Re-label the buttons the moment the input device changes (pad glyphs vs plain text).
+	if _spec_pad_ui_state != int(_last_input_was_pad):
+		_spec_pad_ui_state = int(_last_input_was_pad)
+		_spec_refresh_buttons()
+
 	# Free-fly is its own thing -- decoupled from spectating a player. Show that, hide the cycle arrows.
 	if _spec_mode == SPEC_MODE_FREEFLY:
 		if _spec_prev_btn:
@@ -3057,7 +3066,7 @@ func _spec_update_ui() -> void:
 		if _spec_name_label:
 			_spec_name_label.text = "In Free Cam mode"
 		if _spec_role_label:
-			_spec_role_label.text = "hold Alt for cursor"
+			_spec_role_label.text = "left stick move / X exit" if _last_input_was_pad else "hold Alt for cursor"
 			_spec_role_label.add_theme_color_override("font_color", Color(0.7, 0.7, 0.72))
 			_spec_role_label.visible = true
 		return
@@ -3126,16 +3135,18 @@ func _spec_role_color(role: String) -> Color:
 
 
 func _spec_refresh_buttons() -> void:
+	# On a controller the buttons become hints showing the pad button that triggers each action.
+	var pad := _last_input_was_pad
 	if _spec_toggle_btn:
-		if _spec_mode == SPEC_MODE_FPV:
-			_spec_toggle_btn.text = "Switch to third person"
-		else:
-			_spec_toggle_btn.text = "Switch to FPV view"
+		var t_base: String = "Switch to third person" if _spec_mode == SPEC_MODE_FPV else "Switch to FPV view"
+		_spec_toggle_btn.text = ("[Y]  " + t_base) if pad else t_base
 	if _spec_freefly_btn:
-		if _spec_mode == SPEC_MODE_FREEFLY:
-			_spec_freefly_btn.text = "Exit Free Cam"
-		else:
-			_spec_freefly_btn.text = "Free-fly cam"
+		var f_base: String = "Exit Free Cam" if _spec_mode == SPEC_MODE_FREEFLY else "Free-fly cam"
+		_spec_freefly_btn.text = ("[X]  " + f_base) if pad else f_base
+	if _spec_prev_btn:
+		_spec_prev_btn.text = "LB" if pad else "◀"
+	if _spec_next_btn:
+		_spec_next_btn.text = "RB" if pad else "▶"
 
 
 func _on_spec_toggle_pressed() -> void:
@@ -3288,6 +3299,15 @@ func _collect_rigidbodies(n: Node, center: Vector3, budget: Array, acc: Array) -
 
 
 func _input(event: InputEvent) -> void:
+	# Live input-device detection: last real input wins, so the spectate UI can show pad glyphs on a
+	# controller and plain labels on mouse/keyboard, flipping the instant you switch hands.
+	if event is InputEventJoypadButton and (event as InputEventJoypadButton).pressed:
+		_last_input_was_pad = true
+	elif event is InputEventJoypadMotion and abs((event as InputEventJoypadMotion).axis_value) > 0.5:
+		_last_input_was_pad = true
+	elif event is InputEventMouseMotion or event is InputEventMouseButton or event is InputEventKey:
+		_last_input_was_pad = false
+
 	if _lobby_cam_override_active and event is InputEventMouseMotion and _lobby_look_held():
 		_lobby_mouse_rel += (event as InputEventMouseMotion).relative
 
