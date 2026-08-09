@@ -211,6 +211,11 @@ var _smoke_timer_source: Node = null # the minigame's own timer label we mirror 
 var _round_timer_green: bool = false  # true = Forklift (green digits/bezel), false = Smoke Break (red)
 var _gun_wall_clone: Node3D = null  # group node holding our mirrored window-wall clones (empty -X side)
 var _gun_wall_logged: bool = false  # one-shot diagnostic if we can't find a source wall to duplicate
+
+var _recipe_hud: Control                             # Firearm Factory recipe HUD (top-center), custom-drawn
+var _recipe_seq: PackedInt32Array = PackedInt32Array()  # ordered item ids (1..5) of the local recipe
+var _recipe_index: int = -1                          # current step / done-count; steps before it are fulfilled
+var _recipe_done: bool = false                       # gun fully assembled
 var _gun_probe_last: String = ""  # last art-mesh name the crosshair probe reported (log only on change)
 var _gun_probe_accum: float = 0.0  # throttle timer for the crosshair probe
 
@@ -1147,6 +1152,22 @@ func _create_crosshair() -> void:
 	_smoke_timer_label.add_theme_constant_override("outline_size", 5)
 	_smoke_timer_panel.add_child(_smoke_timer_label)
 
+	# --- Firearm Factory recipe HUD (top-center, custom-drawn pixel-art items) ---
+	_recipe_hud = Control.new()
+	_recipe_hud.name = "FirstPersonViewRecipeHud"
+	_recipe_hud.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_recipe_hud.anchor_left = 0.5
+	_recipe_hud.anchor_right = 0.5
+	_recipe_hud.anchor_top = 0.0
+	_recipe_hud.anchor_bottom = 0.0
+	_recipe_hud.offset_left = -172
+	_recipe_hud.offset_right = 172
+	_recipe_hud.offset_top = 12
+	_recipe_hud.offset_bottom = 92
+	_recipe_hud.visible = false
+	_recipe_hud.draw.connect(_draw_recipe_hud)
+	_crosshair_layer.add_child(_recipe_hud)
+
 	_death_black_rect = ColorRect.new()
 	_death_black_rect.name = "FirstPersonViewDeathBlack"
 	_death_black_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -1433,6 +1454,154 @@ func _hide_class_specific_hud() -> void:
 	_collar_belt.visible = false
 	_cigarette_hud.visible = false
 	_smoke_timer_panel.visible = false
+	if _recipe_hud:
+		_recipe_hud.visible = false
+
+
+func _update_recipe_hud() -> void:
+	# Firearm Factory only: read the LOCAL player's recipe off its workstation (client-safe, read-only)
+	# and show it top-centre. All accesses guarded so the init window / other classes just hide the HUD.
+	if _player_class_name != &"ManufactureGunPlayer" or _player == null or not is_instance_valid(_player):
+		_recipe_hud.visible = false
+		return
+	if not ("game_instance" in _player):
+		_recipe_hud.visible = false
+		return
+	var gi = _player.get("game_instance")
+	if gi == null or not is_instance_valid(gi) or not ("workstation" in gi):
+		_recipe_hud.visible = false
+		return
+	var ws = gi.get("workstation")
+	if ws == null or not is_instance_valid(ws) or not ("item_sequence" in ws) or not ("current_item_sequence_index" in ws):
+		_recipe_hud.visible = false
+		return
+	var seq = ws.get("item_sequence")
+	if not (seq is Array) or (seq as Array).is_empty():
+		_recipe_hud.visible = false
+		return
+	_recipe_seq = PackedInt32Array(seq as Array)
+	_recipe_index = int(ws.get("current_item_sequence_index"))
+	_recipe_done = ("has_gun" in ws) and bool(ws.get("has_gun"))
+	_recipe_hud.visible = true
+	_recipe_hud.queue_redraw()
+
+
+func _draw_recipe_hud() -> void:
+	# A black bar of dark-grey slots (one per recipe step). The current step shows its item as translucent
+	# grey pixel art; finished steps show it in solid real colour; later steps stay hidden (revealed one
+	# at a time, like the in-world holo recipe).
+	var ci: Control = _recipe_hud
+	var n: int = _recipe_seq.size()
+	if n <= 0:
+		return
+	var w: float = ci.size.x
+	var h: float = ci.size.y
+	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.03, 0.03, 0.04, 0.82))
+	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.0, 0.0, 0.0, 0.95), false, 2.0)
+	var pad: float = 8.0
+	var gap: float = 6.0
+	var sq: float = (w - pad * 2.0 - gap * float(n - 1)) / float(n)
+	var top: float = (h - sq) * 0.5
+	for i in n:
+		var x: float = pad + float(i) * (sq + gap)
+		var r := Rect2(x, top, sq, sq)
+		ci.draw_rect(r, Color(0.15, 0.15, 0.17, 1.0))            # dark-grey slot
+		ci.draw_rect(r, Color(0.30, 0.30, 0.34, 1.0), false, 2.0)
+		var fulfilled: bool = (i < _recipe_index) or _recipe_done
+		if fulfilled:
+			_draw_recipe_item(ci, _recipe_seq[i], r, true)
+		elif i == _recipe_index:
+			_draw_recipe_item(ci, _recipe_seq[i], r, false)
+		# later steps: leave the slot empty (revealed one at a time)
+
+
+func _recipe_col(c: Color, solid: bool) -> Color:
+	# Fulfilled -> the item's true colour; still-needed -> a translucent grey (keeps internal shading).
+	if solid:
+		return Color(c.r, c.g, c.b, 1.0)
+	var g: float = c.get_luminance()
+	return Color(g, g, g, 0.5)
+
+
+func _draw_recipe_item(ci: Control, item_id: int, r: Rect2, solid: bool) -> void:
+	var c: Vector2 = r.get_center()
+	var s: float = minf(r.size.x, r.size.y) * 0.40  # icon half-size
+	match item_id:
+		1: _draw_item_gear(ci, c, s, solid)
+		2: _draw_item_pipe(ci, c, s, solid)
+		3: _draw_item_glue(ci, c, s, solid)
+		4: _draw_item_strapped(ci, c, s, solid)
+		5: _draw_item_spring(ci, c, s, solid)
+
+
+func _draw_item_gear(ci: Control, c: Vector2, s: float, solid: bool) -> void:
+	var steel: Color = _recipe_col(Color(0.72, 0.71, 0.68), solid)
+	var dark: Color = _recipe_col(Color(0.44, 0.43, 0.41), solid)
+	var hole: Color = _recipe_col(Color(0.20, 0.20, 0.19), solid)
+	var tw: float = s * 0.36
+	for k in 8:
+		var ang: float = TAU * float(k) / 8.0
+		var p: Vector2 = c + Vector2(cos(ang), sin(ang)) * (s * 0.92)
+		ci.draw_rect(Rect2(p.x - tw * 0.5, p.y - tw * 0.5, tw, tw), steel)
+	ci.draw_circle(c, s * 0.80, steel)   # body
+	ci.draw_circle(c, s * 0.44, dark)    # hub
+	ci.draw_circle(c, s * 0.22, hole)    # centre hole
+
+
+func _draw_item_pipe(ci: Control, c: Vector2, s: float, solid: bool) -> void:
+	var steel: Color = _recipe_col(Color(0.66, 0.65, 0.62), solid)
+	var light: Color = _recipe_col(Color(0.83, 0.82, 0.79), solid)
+	var dark: Color = _recipe_col(Color(0.30, 0.30, 0.29), solid)
+	var hole: Color = _recipe_col(Color(0.12, 0.12, 0.12), solid)
+	var bw: float = s * 1.7
+	var bh: float = s * 0.92
+	var left: float = c.x - bw * 0.5
+	ci.draw_rect(Rect2(left, c.y - bh * 0.5, bw, bh), steel)
+	ci.draw_circle(Vector2(left, c.y), bh * 0.5, steel)
+	ci.draw_circle(Vector2(left + bw, c.y), bh * 0.5, steel)
+	ci.draw_rect(Rect2(left, c.y - bh * 0.42, bw, bh * 0.16), light)   # top highlight
+	ci.draw_circle(Vector2(left, c.y), bh * 0.5, dark)                 # near opening rim
+	ci.draw_circle(Vector2(left, c.y), bh * 0.30, hole)               # bore
+
+
+func _draw_item_glue(ci: Control, c: Vector2, s: float, solid: bool) -> void:
+	var white: Color = _recipe_col(Color(0.90, 0.90, 0.88), solid)
+	var red: Color = _recipe_col(Color(0.86, 0.16, 0.12), solid)
+	var cyan: Color = _recipe_col(Color(0.16, 0.72, 0.84), solid)
+	var bw: float = s * 1.05
+	var bh: float = s * 1.7
+	ci.draw_rect(Rect2(c.x - bw * 0.5, c.y - bh * 0.42, bw, bh * 0.86), white)        # bottle body
+	ci.draw_rect(Rect2(c.x - bw * 0.30, c.y - bh * 0.62, bw * 0.60, bh * 0.24), cyan) # cap
+	ci.draw_rect(Rect2(c.x - bw * 0.5, c.y - bh * 0.04, bw, bh * 0.40), red)          # PVA label
+
+
+func _draw_item_strapped(ci: Control, c: Vector2, s: float, solid: bool) -> void:
+	var steel: Color = _recipe_col(Color(0.60, 0.59, 0.56), solid)
+	var dark: Color = _recipe_col(Color(0.34, 0.34, 0.32), solid)
+	var strap: Color = _recipe_col(Color(0.44, 0.29, 0.18), solid)
+	var pw: float = s * 0.46
+	var ph: float = s * 1.7
+	for k in 3:
+		var px: float = c.x + (float(k) - 1.0) * (pw + s * 0.10)
+		ci.draw_rect(Rect2(px - pw * 0.5, c.y - ph * 0.5, pw, ph), steel)
+		ci.draw_circle(Vector2(px, c.y - ph * 0.5), pw * 0.5, steel)
+		ci.draw_circle(Vector2(px, c.y - ph * 0.5), pw * 0.28, dark)
+	var sw: float = s * 2.0
+	ci.draw_rect(Rect2(c.x - sw * 0.5, c.y - ph * 0.30, sw, ph * 0.16), strap)
+	ci.draw_rect(Rect2(c.x - sw * 0.5, c.y + ph * 0.14, sw, ph * 0.16), strap)
+
+
+func _draw_item_spring(ci: Control, c: Vector2, s: float, solid: bool) -> void:
+	var olive: Color = _recipe_col(Color(0.34, 0.40, 0.26), solid)
+	var loops: int = 4
+	var steps: int = loops * 12
+	var hspan: float = s * 0.92
+	var vspan: float = s * 1.5
+	var pts := PackedVector2Array()
+	for k in steps + 1:
+		var t: float = float(k) / float(steps)
+		pts.append(Vector2(c.x + sin(t * TAU * float(loops)) * hspan, c.y - vspan * 0.5 + t * vspan))
+	ci.draw_polyline(pts, olive, maxf(2.0, s * 0.24), true)
 
 
 func _update_collar_indicator() -> void:
@@ -1760,6 +1929,7 @@ func _render_head_cam(delta: float, active: bool) -> void:
 		_update_collar_indicator()
 		_update_smoke_break_hud()
 		_update_round_timer()
+		_update_recipe_hud()
 	# Gun-game wall: OUTSIDE the active gate so it also appears before/during the countdown. It only
 	# runs here on the FPV render path, so it can't show when FPV is toggled off (see _process).
 	_update_gun_wall(delta)
@@ -2545,6 +2715,9 @@ func _rescan_player() -> void:
 		_smoke_timer_source = null
 		_gun_wall_clone = null
 		_gun_wall_logged = false
+		_recipe_seq = PackedInt32Array()
+		_recipe_index = -1
+		_recipe_done = false
 		if _player_class_name == &"SmokeBreakPlayer" and "anim_handler" in player_node:
 			var anim_h = player_node.get("anim_handler")
 			if anim_h and is_instance_valid(anim_h) and "cig_scale_parent" in anim_h:
