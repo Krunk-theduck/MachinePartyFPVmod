@@ -217,6 +217,12 @@ var _recipe_hud: Control                             # Firearm Factory recipe HU
 var _recipe_seq: PackedInt32Array = PackedInt32Array()  # ordered item ids (1..5) of the local recipe
 var _recipe_index: int = -1                          # current step / done-count; steps before it are fulfilled
 var _recipe_done: bool = false                       # gun fully assembled
+var mod_dir: String = ""                             # set by main.gd -- where the mod (and its textures) live
+const RECIPE_ANIM_FPS := 8.0                         # recipe sprite animation speed (2x2 = 4 frames)
+const RECIPE_ITEM_FILES := {1: "gear.png", 2: "pipe.png", 3: "glue.png", 4: "strapped.png", 5: "spring.png"}
+var _recipe_tex: Dictionary = {}                     # item_id -> full-colour animated sprite sheet Texture2D
+var _recipe_tex_grey: Dictionary = {}                # item_id -> greyscale copy (drawn once fulfilled)
+var _recipe_anim_time: float = 0.0
 
 # --- Spectator system (engages only once we've released to spectate; never touches live play) ---
 const SPEC_MODE_THIRD := 0
@@ -1235,6 +1241,7 @@ func _create_crosshair() -> void:
 	_recipe_hud.visible = false
 	_recipe_hud.draw.connect(_draw_recipe_hud)
 	_crosshair_layer.add_child(_recipe_hud)
+	_load_recipe_textures()
 
 	_death_black_rect = ColorRect.new()
 	_death_black_rect.name = "FirstPersonViewDeathBlack"
@@ -1609,7 +1616,55 @@ func _recipe_col(c: Color, solid: bool) -> Color:
 	return Color(g, g, g, 0.5)
 
 
+func _load_recipe_textures() -> void:
+	if mod_dir == "":
+		print("[fpv_mod] recipe textures: mod_dir not set -- using drawn icons")
+		return
+	for item_id in RECIPE_ITEM_FILES:
+		var tex := _load_recipe_image(String(RECIPE_ITEM_FILES[item_id]))
+		if tex != null:
+			_recipe_tex[item_id] = tex
+			var grey := _greyscale_texture(tex)
+			if grey != null:
+				_recipe_tex_grey[item_id] = grey
+	print("[fpv_mod] recipe sprites loaded: ", _recipe_tex.size(), "/", RECIPE_ITEM_FILES.size(),
+		" from ", mod_dir.path_join("textures/recipe"))
+
+
+func _load_recipe_image(fname: String) -> Texture2D:
+	var path: String = mod_dir.path_join("textures").path_join("recipe").path_join(fname)
+	var img := Image.new()
+	if img.load(path) != OK:
+		return null
+	# Downscale -- the icons draw ~40px, and it keeps the one-time greyscale pass cheap.
+	var tw: int = 128
+	var th: int = int(round(128.0 * float(img.get_height()) / float(img.get_width())))
+	img.resize(tw, maxi(th, 1), Image.INTERPOLATE_LANCZOS)
+	return ImageTexture.create_from_image(img)
+
+
+func _greyscale_texture(tex: Texture2D) -> Texture2D:
+	var img: Image = tex.get_image().duplicate()
+	if img.get_format() != Image.FORMAT_RGBA8:
+		img.convert(Image.FORMAT_RGBA8)
+	var data: PackedByteArray = img.get_data()
+	var i: int = 0
+	var n: int = data.size()
+	while i + 3 < n:
+		var l: int = int(0.299 * float(data[i]) + 0.587 * float(data[i + 1]) + 0.114 * float(data[i + 2]))
+		data[i] = l
+		data[i + 1] = l
+		data[i + 2] = l
+		i += 4
+	var out := Image.create_from_data(img.get_width(), img.get_height(), false, Image.FORMAT_RGBA8, data)
+	return ImageTexture.create_from_image(out)
+
+
 func _draw_recipe_item(ci: Control, item_id: int, r: Rect2, solid: bool) -> void:
+	# solid == true means the step is FULFILLED (translucent grey); false means CURRENT (semi-transparent
+	# colour). Animated sprite if the texture is present, else the drawn-icon fallback.
+	if _draw_recipe_sprite(ci, item_id, r, solid):
+		return
 	var c: Vector2 = r.get_center()
 	var s: float = minf(r.size.x, r.size.y) * 0.40  # icon half-size
 	match item_id:
@@ -1618,6 +1673,25 @@ func _draw_recipe_item(ci: Control, item_id: int, r: Rect2, solid: bool) -> void
 		3: _draw_item_glue(ci, c, s, solid)
 		4: _draw_item_strapped(ci, c, s, solid)
 		5: _draw_item_spring(ci, c, s, solid)
+
+
+func _draw_recipe_sprite(ci: Control, item_id: int, r: Rect2, fulfilled: bool) -> bool:
+	var tex: Texture2D = _recipe_tex_grey.get(item_id) if fulfilled else _recipe_tex.get(item_id)
+	if tex == null:
+		return false
+	var alpha: float = 0.45 if fulfilled else 0.62
+	var fw: float = float(tex.get_width()) * 0.5   # 2x2 sheet -> frame is half the size
+	var fh: float = float(tex.get_height()) * 0.5
+	var frame: int = int(_recipe_anim_time * RECIPE_ANIM_FPS) % 4
+	var inset: float = 1.0  # trim any baked grid line at the frame seam
+	var src := Rect2(float(frame % 2) * fw + inset, float(frame / 2) * fh + inset, fw - inset * 2.0, fh - inset * 2.0)
+	var scale: float = minf(r.size.x / fw, r.size.y / fh) * 0.98
+	var dw: float = fw * scale
+	var dh: float = fh * scale
+	var cen: Vector2 = r.get_center()
+	var dest := Rect2(cen.x - dw * 0.5, cen.y - dh * 0.5, dw, dh)
+	ci.draw_texture_rect_region(tex, dest, src, Color(1.0, 1.0, 1.0, alpha))
+	return true
 
 
 func _draw_item_gear(ci: Control, c: Vector2, s: float, solid: bool) -> void:
@@ -1852,6 +1926,7 @@ func _smooth_head_pos_toward(current: Vector3, target: Vector3, delta: float) ->
 
 func _process(delta: float) -> void:
 	_update_secret_level_floor(delta)
+	_recipe_anim_time += delta
 
 	# Spectator drive. Runs off the release flag (not the local rig), so it survives the dead body
 	# being removed/ragdolled. Returns false when spectating is genuinely over (minigame gone or we

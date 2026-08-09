@@ -22,6 +22,7 @@ func _mod_ready(loader) -> void:
 	var controller := Node.new()
 	controller.set_script(controller_script)
 	controller.name = "FirstPersonViewController"
+	controller.set("mod_dir", dir)  # so the controller can load bundled textures (recipe sprites)
 	get_tree().root.add_child.call_deferred(controller)
 
 	loader.note("fpv mod ready")
