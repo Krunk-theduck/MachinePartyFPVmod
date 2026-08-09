@@ -1844,6 +1844,11 @@ func _process(delta: float) -> void:
 		and _skeleton != null and is_instance_valid(_skeleton) and _head_bone_idx >= 0)
 	var active := have_rig and _player_is_active()
 
+	# Spectator UI/cam must disappear the instant we stop being a live-round spectator -- round over,
+	# match ended (rig gone), or respawned. Otherwise the name/arrows/buttons and our camera linger.
+	if _spec_engaged and (not _spectating_released or not have_rig):
+		_spectate_disengage()
+
 	# Forklift has three distinct inactive states, handled in priority order:
 	if have_rig and _player_class_name == &"ForkliftCertifiedVehicle":
 		# (1) ELIMINATED this round (blood decals shown) -> ride the body ~3s then cut to 3rd person
@@ -2467,10 +2472,10 @@ func _create_spectate_ui() -> void:
 	_spec_name_panel.anchor_right = 0.5
 	_spec_name_panel.anchor_top = 1.0
 	_spec_name_panel.anchor_bottom = 1.0
-	_spec_name_panel.offset_left = -200
-	_spec_name_panel.offset_right = 200
-	_spec_name_panel.offset_top = -108
-	_spec_name_panel.offset_bottom = -22
+	_spec_name_panel.offset_left = -150
+	_spec_name_panel.offset_right = 150
+	_spec_name_panel.offset_top = -80
+	_spec_name_panel.offset_bottom = -20
 	_spec_name_panel.visible = false
 	_crosshair_layer.add_child(_spec_name_panel)
 
@@ -2484,10 +2489,10 @@ func _create_spectate_ui() -> void:
 	_spec_prev_btn = Button.new()
 	_spec_prev_btn.name = "Prev"
 	_spec_prev_btn.text = "◀"  # left triangle
-	_spec_prev_btn.offset_left = 6
-	_spec_prev_btn.offset_right = 54
-	_spec_prev_btn.offset_top = 18
-	_spec_prev_btn.offset_bottom = 66
+	_spec_prev_btn.offset_left = 5
+	_spec_prev_btn.offset_right = 39
+	_spec_prev_btn.offset_top = 13
+	_spec_prev_btn.offset_bottom = 47
 	_style_native_button(_spec_prev_btn)
 	_spec_prev_btn.pressed.connect(_on_spec_prev_pressed)
 	_spec_name_panel.add_child(_spec_prev_btn)
@@ -2497,10 +2502,10 @@ func _create_spectate_ui() -> void:
 	_spec_next_btn.text = "▶"  # right triangle
 	_spec_next_btn.anchor_left = 1.0
 	_spec_next_btn.anchor_right = 1.0
-	_spec_next_btn.offset_left = -54
-	_spec_next_btn.offset_right = -6
-	_spec_next_btn.offset_top = 18
-	_spec_next_btn.offset_bottom = 66
+	_spec_next_btn.offset_left = -39
+	_spec_next_btn.offset_right = -5
+	_spec_next_btn.offset_top = 13
+	_spec_next_btn.offset_bottom = 47
 	_style_native_button(_spec_next_btn)
 	_spec_next_btn.pressed.connect(_on_spec_next_pressed)
 	_spec_name_panel.add_child(_spec_next_btn)
@@ -2509,15 +2514,15 @@ func _create_spectate_ui() -> void:
 	_spec_name_label.name = "SpecName"
 	_spec_name_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_spec_name_label.anchor_right = 1.0
-	_spec_name_label.offset_left = 58
-	_spec_name_label.offset_right = -58
-	_spec_name_label.offset_top = 8
-	_spec_name_label.offset_bottom = 46
+	_spec_name_label.offset_left = 44
+	_spec_name_label.offset_right = -44
+	_spec_name_label.offset_top = 5
+	_spec_name_label.offset_bottom = 34
 	_spec_name_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_spec_name_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	if _spec_font:
 		_spec_name_label.add_theme_font_override("font", _spec_font)
-	_spec_name_label.add_theme_font_size_override("font_size", 26)
+	_spec_name_label.add_theme_font_size_override("font_size", 19)
 	_spec_name_label.add_theme_color_override("font_color", Color(0.96, 0.96, 0.94))
 	_spec_name_panel.add_child(_spec_name_label)
 
@@ -2525,15 +2530,15 @@ func _create_spectate_ui() -> void:
 	_spec_role_label.name = "SpecRole"
 	_spec_role_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_spec_role_label.anchor_right = 1.0
-	_spec_role_label.offset_left = 58
-	_spec_role_label.offset_right = -58
-	_spec_role_label.offset_top = 46
-	_spec_role_label.offset_bottom = 78
+	_spec_role_label.offset_left = 44
+	_spec_role_label.offset_right = -44
+	_spec_role_label.offset_top = 33
+	_spec_role_label.offset_bottom = 56
 	_spec_role_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_spec_role_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	if _spec_font:
 		_spec_role_label.add_theme_font_override("font", _spec_font)
-	_spec_role_label.add_theme_font_size_override("font_size", 16)
+	_spec_role_label.add_theme_font_size_override("font_size", 12)
 	_spec_role_label.add_theme_color_override("font_color", Color(0.85, 0.85, 0.85))
 	_spec_name_panel.add_child(_spec_role_label)
 
@@ -2580,15 +2585,18 @@ func _update_spectate(delta: float) -> void:
 	if _spec_target == null or not is_instance_valid(_spec_target) or not _spec_is_alive(_spec_target):
 		_spec_pick_target()
 
+	# Third-person hands to the game's OWN spectator camera (exact vanilla view); FPV/free-fly use ours.
 	if _spec_mode == SPEC_MODE_FREEFLY:
+		if not _spec_cam.current:
+			_spec_cam.current = true
 		_spec_update_freefly(delta)
 	elif _spec_mode == SPEC_MODE_FPV:
+		if not _spec_cam.current:
+			_spec_cam.current = true
 		_spec_update_fpv()
 	else:
 		_spec_update_third()
 
-	if not _spec_cam.current:
-		_spec_cam.current = true
 	_spec_update_ui()
 	_spec_update_mouse()
 
@@ -2604,7 +2612,7 @@ func _spectate_engage() -> void:
 	_spec_cam = Camera3D.new()
 	_spec_cam.name = "FpvSpectatorCamera"
 	get_tree().root.add_child(_spec_cam)
-	_spec_cam.current = true
+	# NOT made current here -- the default third-person mode hands to the game's own camera.
 
 	if _spec_spawn_captured:
 		_spec_freefly_pos = _spec_spawn_pos
@@ -2796,15 +2804,17 @@ func _spec_body_yaw(t: Node) -> float:
 
 
 func _spec_update_third() -> void:
-	var t := _spec_target
-	if t == null or not is_instance_valid(t) or not (t is Node3D):
-		return
-	var head := _spec_head_origin(t)
-	var yaw := _spec_body_yaw(t)
-	var fwd := Vector3(-sin(yaw), 0.0, -cos(yaw))  # the way the body faces
-	var pos := head - fwd * 3.4 + Vector3(0.0, 1.2, 0.0)
-	_spec_cam.global_position = pos
-	_spec_cam.look_at(head + Vector3(0.0, 0.15, 0.0), Vector3.UP)
+	# The default view is the game's OWN 3rd-person spectator/overview camera -- the exact vanilla
+	# view a dead player sees. We just re-assert it as current and release ours; never a custom orbit.
+	if _spec_cam != null and is_instance_valid(_spec_cam) and _spec_cam.current:
+		_spec_cam.current = false
+	var gcam := _find_game_camera(true)
+	if gcam == null and _orig_camera != null and is_instance_valid(_orig_camera):
+		gcam = _orig_camera
+	if gcam == null:
+		gcam = _find_fallback_camera()
+	if gcam != null and is_instance_valid(gcam) and not gcam.current:
+		gcam.current = true
 
 
 func _spec_update_fpv() -> void:
