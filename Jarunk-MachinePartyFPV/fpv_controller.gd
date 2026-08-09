@@ -216,6 +216,33 @@ var _recipe_hud: Control                             # Firearm Factory recipe HU
 var _recipe_seq: PackedInt32Array = PackedInt32Array()  # ordered item ids (1..5) of the local recipe
 var _recipe_index: int = -1                          # current step / done-count; steps before it are fulfilled
 var _recipe_done: bool = false                       # gun fully assembled
+
+# --- Spectator system (engages only once we've released to spectate; never touches live play) ---
+const SPEC_MODE_THIRD := 0
+const SPEC_MODE_FPV := 1
+const SPEC_MODE_FREEFLY := 2
+const SPEC_FREEFLY_SPEED := 9.0     # base free-fly move speed (units/sec)
+const SPEC_FREEFLY_LOOK := 0.0035   # free-fly mouse look sensitivity (rad/pixel)
+var _spec_engaged: bool = false     # my spectate system is active (I'm dead + spectating a live round)
+var _spec_mode: int = SPEC_MODE_THIRD  # third-person is the default
+var _spec_cam: Camera3D = null      # my own spectator camera (created on engage, freed on disengage)
+var _spec_target: Node = null       # the player node I'm currently watching
+var _spec_targets: Array = []       # living player nodes to cycle through (rebuilt periodically)
+var _spec_rebuild_accum: float = 0.0
+var _spec_freefly_pos: Vector3 = Vector3.ZERO
+var _spec_freefly_yaw: float = 0.0
+var _spec_freefly_pitch: float = 0.0
+var _spec_font: Font = null
+var _spec_toggle_btn: Button = null   # top-right: "Switch to FPV view" / "Switch to third person"
+var _spec_freefly_btn: Button = null  # under the toggle: enable free-fly
+var _spec_name_panel: Control = null  # bottom-center: spectated name + role + prev/next arrows
+var _spec_name_label: Label = null
+var _spec_role_label: Label = null
+var _spec_prev_btn: Button = null
+var _spec_next_btn: Button = null
+var _spec_spawn_pos: Vector3 = Vector3.ZERO   # local player's spawn point (free-fly start)
+var _spec_spawn_captured: bool = false
+var _spec_grabbed_mouse: bool = false         # we captured the mouse for free-fly RMB look
 var _gun_probe_last: String = ""  # last art-mesh name the crosshair probe reported (log only on change)
 var _gun_probe_accum: float = 0.0  # throttle timer for the crosshair probe
 
@@ -1174,6 +1201,9 @@ func _create_crosshair() -> void:
 	_death_black_rect.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_death_black_rect.color = Color(0.0, 0.0, 0.0, 0.0)
 	_crosshair_layer.add_child(_death_black_rect)
+
+	# Spectator UI sits ABOVE the death-black rect so its buttons stay clickable during spectate.
+	_create_spectate_ui()
 
 
 func _draw_crosshair() -> void:
@@ -2140,6 +2170,7 @@ func _class_from_skeleton_owner() -> StringName:
 
 func _process_death_cam(delta: float) -> void:
 	if _spectating_released:
+		_update_spectate(delta)  # my spectator system drives the view once we've handed to spectate
 		return
 
 	if not _dying:
@@ -2312,7 +2343,552 @@ func _end_death_cam() -> void:
 	_dying_hat = null
 	_dying_hat_search_active = false
 	_spectating_released = false
+	_spectate_disengage()  # tear down my spectator cam/UI whenever we leave the spectate state
 	_set_death_black(0.0)
+
+
+# =====================================================================================
+# Spectator system -- engages ONLY once the mod has handed to spectate (`_spectating_released`).
+# Three view modes over the living players: third-person (default), FPV (their view), and a
+# no-clip free-fly cam. Fully client-side and read-only; it never touches live play. Works the
+# same whether you host or join, your lobby or someone else's, because it only reads nodes the
+# base game already replicates to every client.
+# =====================================================================================
+
+func _create_spectate_ui() -> void:
+	_spec_font = load("res://fonts/Terminal F4.ttf") as Font
+
+	# Top-right: toggle between third-person and the spectated player's FPV.
+	_spec_toggle_btn = Button.new()
+	_spec_toggle_btn.name = "FpvSpecToggle"
+	_spec_toggle_btn.text = "Switch to FPV view"
+	_spec_toggle_btn.anchor_left = 1.0
+	_spec_toggle_btn.anchor_right = 1.0
+	_spec_toggle_btn.offset_left = -262
+	_spec_toggle_btn.offset_right = -18
+	_spec_toggle_btn.offset_top = 18
+	_spec_toggle_btn.offset_bottom = 58
+	_style_native_button(_spec_toggle_btn)
+	_spec_toggle_btn.visible = false
+	_spec_toggle_btn.pressed.connect(_on_spec_toggle_pressed)
+	_crosshair_layer.add_child(_spec_toggle_btn)
+
+	# Directly under the toggle: enable / exit the free-fly cam.
+	_spec_freefly_btn = Button.new()
+	_spec_freefly_btn.name = "FpvSpecFreefly"
+	_spec_freefly_btn.text = "Free-fly cam"
+	_spec_freefly_btn.anchor_left = 1.0
+	_spec_freefly_btn.anchor_right = 1.0
+	_spec_freefly_btn.offset_left = -262
+	_spec_freefly_btn.offset_right = -18
+	_spec_freefly_btn.offset_top = 64
+	_spec_freefly_btn.offset_bottom = 104
+	_style_native_button(_spec_freefly_btn)
+	_spec_freefly_btn.visible = false
+	_spec_freefly_btn.pressed.connect(_on_spec_freefly_pressed)
+	_crosshair_layer.add_child(_spec_freefly_btn)
+
+	# Bottom-center: spectated player's name + role tag, flanked by cycle arrows.
+	_spec_name_panel = Control.new()
+	_spec_name_panel.name = "FpvSpecNamePanel"
+	_spec_name_panel.mouse_filter = Control.MOUSE_FILTER_PASS
+	_spec_name_panel.anchor_left = 0.5
+	_spec_name_panel.anchor_right = 0.5
+	_spec_name_panel.anchor_top = 1.0
+	_spec_name_panel.anchor_bottom = 1.0
+	_spec_name_panel.offset_left = -200
+	_spec_name_panel.offset_right = 200
+	_spec_name_panel.offset_top = -108
+	_spec_name_panel.offset_bottom = -22
+	_spec_name_panel.visible = false
+	_crosshair_layer.add_child(_spec_name_panel)
+
+	var name_bg := ColorRect.new()
+	name_bg.name = "Bg"
+	name_bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	name_bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	name_bg.color = Color(0.04, 0.04, 0.05, 0.78)
+	_spec_name_panel.add_child(name_bg)
+
+	_spec_prev_btn = Button.new()
+	_spec_prev_btn.name = "Prev"
+	_spec_prev_btn.text = "◀"  # left triangle
+	_spec_prev_btn.offset_left = 6
+	_spec_prev_btn.offset_right = 54
+	_spec_prev_btn.offset_top = 18
+	_spec_prev_btn.offset_bottom = 66
+	_style_native_button(_spec_prev_btn)
+	_spec_prev_btn.pressed.connect(_on_spec_prev_pressed)
+	_spec_name_panel.add_child(_spec_prev_btn)
+
+	_spec_next_btn = Button.new()
+	_spec_next_btn.name = "Next"
+	_spec_next_btn.text = "▶"  # right triangle
+	_spec_next_btn.anchor_left = 1.0
+	_spec_next_btn.anchor_right = 1.0
+	_spec_next_btn.offset_left = -54
+	_spec_next_btn.offset_right = -6
+	_spec_next_btn.offset_top = 18
+	_spec_next_btn.offset_bottom = 66
+	_style_native_button(_spec_next_btn)
+	_spec_next_btn.pressed.connect(_on_spec_next_pressed)
+	_spec_name_panel.add_child(_spec_next_btn)
+
+	_spec_name_label = Label.new()
+	_spec_name_label.name = "SpecName"
+	_spec_name_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_spec_name_label.anchor_right = 1.0
+	_spec_name_label.offset_left = 58
+	_spec_name_label.offset_right = -58
+	_spec_name_label.offset_top = 8
+	_spec_name_label.offset_bottom = 46
+	_spec_name_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_spec_name_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	if _spec_font:
+		_spec_name_label.add_theme_font_override("font", _spec_font)
+	_spec_name_label.add_theme_font_size_override("font_size", 26)
+	_spec_name_label.add_theme_color_override("font_color", Color(0.96, 0.96, 0.94))
+	_spec_name_panel.add_child(_spec_name_label)
+
+	_spec_role_label = Label.new()
+	_spec_role_label.name = "SpecRole"
+	_spec_role_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_spec_role_label.anchor_right = 1.0
+	_spec_role_label.offset_left = 58
+	_spec_role_label.offset_right = -58
+	_spec_role_label.offset_top = 46
+	_spec_role_label.offset_bottom = 78
+	_spec_role_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_spec_role_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	if _spec_font:
+		_spec_role_label.add_theme_font_override("font", _spec_font)
+	_spec_role_label.add_theme_font_size_override("font_size", 16)
+	_spec_role_label.add_theme_color_override("font_color", Color(0.85, 0.85, 0.85))
+	_spec_name_panel.add_child(_spec_role_label)
+
+
+func _style_native_button(btn: Button) -> void:
+	if _spec_font:
+		btn.add_theme_font_override("font", _spec_font)
+	btn.add_theme_font_size_override("font_size", 18)
+	btn.add_theme_color_override("font_color", Color(0.92, 0.92, 0.9))
+	btn.add_theme_color_override("font_hover_color", Color(1, 1, 1))
+	btn.add_theme_color_override("font_pressed_color", Color(0.7, 0.7, 0.7))
+	btn.add_theme_stylebox_override("normal", _native_stylebox(Color(0.06, 0.06, 0.08, 0.9)))
+	btn.add_theme_stylebox_override("hover", _native_stylebox(Color(0.14, 0.14, 0.17, 0.95)))
+	btn.add_theme_stylebox_override("pressed", _native_stylebox(Color(0.02, 0.02, 0.03, 0.95)))
+	btn.add_theme_stylebox_override("focus", _native_stylebox(Color(0.06, 0.06, 0.08, 0.0)))
+
+
+func _native_stylebox(bg: Color) -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = bg
+	sb.border_color = Color(0.55, 0.55, 0.6, 0.85)
+	sb.set_border_width_all(2)
+	sb.set_corner_radius_all(3)
+	sb.content_margin_left = 8
+	sb.content_margin_right = 8
+	sb.content_margin_top = 4
+	sb.content_margin_bottom = 4
+	return sb
+
+
+func _update_spectate(delta: float) -> void:
+	if not _spec_engaged:
+		_spectate_engage()
+	if _spec_cam == null or not is_instance_valid(_spec_cam):
+		return
+
+	# Refresh the living-player roster periodically (players die / roles flip mid-round).
+	_spec_rebuild_accum += delta
+	if _spec_rebuild_accum >= 0.5:
+		_spec_rebuild_accum = 0.0
+		_spec_build_targets()
+
+	# Keep a valid, still-living target.
+	if _spec_target == null or not is_instance_valid(_spec_target) or not _spec_is_alive(_spec_target):
+		_spec_pick_target()
+
+	if _spec_mode == SPEC_MODE_FREEFLY:
+		_spec_update_freefly(delta)
+	elif _spec_mode == SPEC_MODE_FPV:
+		_spec_update_fpv()
+	else:
+		_spec_update_third()
+
+	if not _spec_cam.current:
+		_spec_cam.current = true
+	_spec_update_ui()
+	_spec_update_mouse()
+
+
+func _spectate_engage() -> void:
+	_spec_engaged = true
+	_spec_mode = SPEC_MODE_THIRD
+	_spec_grabbed_mouse = false
+	_spec_rebuild_accum = 0.0
+	_spec_build_targets()
+	_spec_pick_target()
+
+	_spec_cam = Camera3D.new()
+	_spec_cam.name = "FpvSpectatorCamera"
+	get_tree().root.add_child(_spec_cam)
+	_spec_cam.current = true
+
+	if _spec_spawn_captured:
+		_spec_freefly_pos = _spec_spawn_pos
+	elif _spec_target and is_instance_valid(_spec_target) and _spec_target is Node3D:
+		_spec_freefly_pos = (_spec_target as Node3D).global_position + Vector3(0, 2.0, 0)
+	_spec_freefly_yaw = 0.0
+	_spec_freefly_pitch = -0.12
+
+	if _spec_toggle_btn:
+		_spec_toggle_btn.visible = true
+	if _spec_freefly_btn:
+		_spec_freefly_btn.visible = true
+	if _spec_name_panel:
+		_spec_name_panel.visible = true
+	_spec_refresh_buttons()
+	print("[fpv_mod] spectate engaged (", _spec_targets.size(), " living targets)")
+
+
+func _spectate_disengage() -> void:
+	if _spec_grabbed_mouse and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	_spec_grabbed_mouse = false
+	if _spec_cam and is_instance_valid(_spec_cam):
+		_spec_cam.current = false
+		if _spec_cam.get_parent() != null:
+			_spec_cam.get_parent().remove_child(_spec_cam)
+		_spec_cam.queue_free()
+	_spec_cam = null
+	_spec_target = null
+	_spec_targets.clear()
+	if _spec_toggle_btn:
+		_spec_toggle_btn.visible = false
+	if _spec_freefly_btn:
+		_spec_freefly_btn.visible = false
+	if _spec_name_panel:
+		_spec_name_panel.visible = false
+	if not _spec_engaged:
+		return
+	_spec_engaged = false
+	print("[fpv_mod] spectate disengaged")
+
+
+func _spec_minigame() -> Node:
+	if _player == null or not is_instance_valid(_player):
+		return null
+	var cur: Node = _player
+	while cur != null and is_instance_valid(cur):
+		if _script_is_or_extends(cur.get_script(), &"Minigame"):
+			return cur
+		cur = cur.get_parent()
+	return null
+
+
+func _spec_build_targets() -> void:
+	var mg := _spec_minigame()
+	if mg == null:
+		return
+	var skels: Array = []
+	_spec_collect_head_skeletons(mg, skels, [SCAN_BUDGET])
+	var seen_ids := {}
+	var players: Array = []
+	for sk in skels:
+		var pnode := _spec_player_of_skeleton(sk as Node)
+		if pnode == null:
+			continue
+		var pid := _spec_id_of(pnode)
+		if pid == 0 or seen_ids.has(pid):
+			continue
+		seen_ids[pid] = true
+		players.append(pnode)
+	var alive: Array = []
+	for p in players:
+		if _spec_is_alive(p):
+			alive.append(p)
+	alive.sort_custom(_spec_sort_by_id)
+	_spec_targets = alive
+
+
+func _spec_collect_head_skeletons(n: Node, out: Array, budget: Array) -> void:
+	if budget[0] <= 0:
+		return
+	budget[0] -= 1
+	if n is Skeleton3D:
+		var sk := n as Skeleton3D
+		if sk.find_bone("head") >= 0 and sk.is_visible_in_tree() and sk.get_viewport() == get_tree().root:
+			out.append(sk)
+	for c in n.get_children():
+		_spec_collect_head_skeletons(c, out, budget)
+
+
+func _spec_player_of_skeleton(sk: Node) -> Node:
+	var cur := sk.get_parent()
+	while cur != null:
+		if "player_presence" in cur:
+			var pp = cur.get("player_presence")
+			if pp != null and is_instance_valid(pp):
+				return cur
+		cur = cur.get_parent()
+	return null
+
+
+func _spec_id_of(node: Node) -> int:
+	if node == null or not is_instance_valid(node) or not ("player_presence" in node):
+		return 0
+	var pp = node.get("player_presence")
+	if pp == null or not is_instance_valid(pp) or not ("network_id" in pp):
+		return 0
+	return int(pp.get("network_id"))
+
+
+func _spec_sort_by_id(a: Node, b: Node) -> bool:
+	return _spec_id_of(a) < _spec_id_of(b)
+
+
+func _spec_is_alive(p: Node) -> bool:
+	if p == null or not is_instance_valid(p):
+		return false
+	if "is_dead" in p and bool(p.get("is_dead")):
+		return false
+	if "is_alive" in p:
+		return bool(p.get("is_alive"))
+	if "lives" in p:
+		return int(p.get("lives")) > 0
+	if "health" in p:
+		return float(p.get("health")) > 0.0
+	return true
+
+
+func _spec_pick_target() -> void:
+	if _spec_targets.is_empty():
+		_spec_target = null
+		return
+	if _spec_target != null and is_instance_valid(_spec_target) and _spec_target in _spec_targets and _spec_is_alive(_spec_target):
+		return
+	_spec_target = _spec_targets[0]
+
+
+func _spec_cycle(dir: int) -> void:
+	_spec_build_targets()
+	if _spec_targets.is_empty():
+		return
+	var idx := _spec_targets.find(_spec_target)
+	if idx < 0:
+		idx = 0
+	else:
+		idx = (idx + dir) % _spec_targets.size()
+		if idx < 0:
+			idx += _spec_targets.size()
+	_spec_target = _spec_targets[idx]
+
+
+func _spec_head_origin(t: Node) -> Vector3:
+	var sk := _first_skeleton_with_head(t, [SCAN_BUDGET])
+	if sk != null:
+		var idx: int = (sk as Skeleton3D).find_bone("head")
+		if idx >= 0:
+			var gt: Transform3D = (sk as Skeleton3D).global_transform * (sk as Skeleton3D).get_bone_global_pose(idx)
+			return gt.origin
+	if t is Node3D:
+		return (t as Node3D).global_position + Vector3(0, 1.6, 0)
+	return Vector3.ZERO
+
+
+func _spec_body_yaw(t: Node) -> float:
+	var sk := _first_skeleton_with_head(t, [SCAN_BUDGET])
+	if sk != null:
+		var vis := _direct_child_ancestor(t, sk)
+		if vis is Node3D:
+			return (vis as Node3D).global_rotation.y
+	if t is Node3D:
+		return (t as Node3D).global_rotation.y
+	return 0.0
+
+
+func _spec_update_third() -> void:
+	var t := _spec_target
+	if t == null or not is_instance_valid(t) or not (t is Node3D):
+		return
+	var head := _spec_head_origin(t)
+	var yaw := _spec_body_yaw(t)
+	var fwd := Vector3(-sin(yaw), 0.0, -cos(yaw))  # the way the body faces
+	var pos := head - fwd * 3.4 + Vector3(0.0, 1.2, 0.0)
+	_spec_cam.global_position = pos
+	_spec_cam.look_at(head + Vector3(0.0, 0.15, 0.0), Vector3.UP)
+
+
+func _spec_update_fpv() -> void:
+	var t := _spec_target
+	if t == null or not is_instance_valid(t):
+		return
+	# If this player owns a networked camera (the Duck Hunt hunter's aim/scope cam), mirror it exactly
+	# -- the base game replicates that camera to every client, so it works with no mod on their end.
+	if _spec_use_owned_camera(t):
+		var oc = t.get("camera")
+		if oc is Camera3D and is_instance_valid(oc) and oc != _spec_cam:
+			_spec_cam.global_transform = (oc as Camera3D).global_transform
+			return
+	# Fallback (matches a non-modded player's view): sit at their head, face their body direction.
+	var head := _spec_head_origin(t)
+	var yaw := _spec_body_yaw(t)
+	var fwd := Vector3(-sin(yaw), 0.0, -cos(yaw))
+	_spec_cam.global_position = head + fwd * 0.08 + Vector3(0.0, 0.02, 0.0)
+	_spec_cam.global_rotation = Vector3(0.0, yaw, 0.0)
+
+
+func _spec_use_owned_camera(t: Node) -> bool:
+	if not ("camera" in t):
+		return false
+	return _spec_role_for(t) == "HUNTER"
+
+
+func _spec_update_freefly(delta: float) -> void:
+	var speed := SPEC_FREEFLY_SPEED
+	if Input.is_key_pressed(KEY_SHIFT):
+		speed *= 3.0
+	if Input.is_key_pressed(KEY_ALT):
+		speed *= 0.3
+	var basis := Basis.from_euler(Vector3(_spec_freefly_pitch, _spec_freefly_yaw, 0.0))
+	var dir := Vector3.ZERO
+	if Input.is_key_pressed(KEY_W):
+		dir -= basis.z
+	if Input.is_key_pressed(KEY_S):
+		dir += basis.z
+	if Input.is_key_pressed(KEY_A):
+		dir -= basis.x
+	if Input.is_key_pressed(KEY_D):
+		dir += basis.x
+	if Input.is_key_pressed(KEY_E) or Input.is_key_pressed(KEY_SPACE):
+		dir += Vector3.UP
+	if Input.is_key_pressed(KEY_Q) or Input.is_key_pressed(KEY_CTRL):
+		dir -= Vector3.UP
+	if dir.length() > 0.001:
+		_spec_freefly_pos += dir.normalized() * speed * delta
+	_spec_cam.global_transform = Transform3D(basis, _spec_freefly_pos)
+
+
+func _spec_update_mouse() -> void:
+	var want_capture := _spec_mode == SPEC_MODE_FREEFLY and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
+	if want_capture:
+		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
+			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+			_spec_grabbed_mouse = true
+	elif _spec_grabbed_mouse:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+		_spec_grabbed_mouse = false
+
+
+func _spec_update_ui() -> void:
+	if _spec_target != null and is_instance_valid(_spec_target):
+		if _spec_name_label:
+			_spec_name_label.text = _spec_name_of(_spec_target)
+		if _spec_role_label:
+			var role := _spec_role_for(_spec_target)
+			_spec_role_label.text = role
+			_spec_role_label.add_theme_color_override("font_color", _spec_role_color(role))
+			_spec_role_label.visible = role != ""
+	else:
+		if _spec_name_label:
+			_spec_name_label.text = "(no players)"
+		if _spec_role_label:
+			_spec_role_label.text = ""
+
+
+func _spec_name_of(t: Node) -> String:
+	if "player_presence" in t:
+		var pp = t.get("player_presence")
+		if pp != null and is_instance_valid(pp) and "network_name" in pp:
+			var nm := String(pp.get("network_name"))
+			if nm != "":
+				return nm
+	return String(t.name)
+
+
+func _spec_role_for(t: Node) -> String:
+	if t == null or not is_instance_valid(t):
+		return ""
+	var sc: Script = t.get_script()
+	var cn: String = ""
+	if sc != null:
+		cn = String(sc.get_global_name())
+	if cn == "KnifeAtTheOfficePlayer":
+		if "is_infected" in t and bool(t.get("is_infected")):
+			return "INFECTED"
+		return "SURVIVOR"
+	if cn.contains("DuckHunt"):
+		if cn.contains("Hunter") or ("is_hunter" in t and bool(t.get("is_hunter"))):
+			return "HUNTER"
+		return "RUNNER"
+	if "is_infected" in t and bool(t.get("is_infected")):
+		return "INFECTED"
+	if "is_hunter" in t and bool(t.get("is_hunter")):
+		return "HUNTER"
+	return ""
+
+
+func _spec_role_color(role: String) -> Color:
+	match role:
+		"INFECTED":
+			return Color(0.35, 0.8, 0.42)
+		"HUNTER":
+			return Color(0.96, 0.55, 0.2)
+		"SURVIVOR":
+			return Color(0.5, 0.76, 1.0)
+		"RUNNER":
+			return Color(0.92, 0.86, 0.4)
+	return Color(0.85, 0.85, 0.85)
+
+
+func _spec_refresh_buttons() -> void:
+	if _spec_toggle_btn:
+		if _spec_mode == SPEC_MODE_FPV:
+			_spec_toggle_btn.text = "Switch to third person"
+		else:
+			_spec_toggle_btn.text = "Switch to FPV view"
+	if _spec_freefly_btn:
+		if _spec_mode == SPEC_MODE_FREEFLY:
+			_spec_freefly_btn.text = "Exit free-fly"
+		else:
+			_spec_freefly_btn.text = "Free-fly cam"
+
+
+func _on_spec_toggle_pressed() -> void:
+	if not _spec_engaged:
+		return
+	if _spec_mode == SPEC_MODE_FPV:
+		_spec_mode = SPEC_MODE_THIRD
+	else:
+		_spec_mode = SPEC_MODE_FPV  # from third OR free-fly, the toggle goes to FPV
+	_spec_refresh_buttons()
+
+
+func _on_spec_freefly_pressed() -> void:
+	if not _spec_engaged:
+		return
+	if _spec_mode == SPEC_MODE_FREEFLY:
+		_spec_mode = SPEC_MODE_THIRD
+	else:
+		if _spec_spawn_captured:
+			_spec_freefly_pos = _spec_spawn_pos
+		elif _spec_cam and is_instance_valid(_spec_cam):
+			_spec_freefly_pos = _spec_cam.global_position
+		if _spec_cam and is_instance_valid(_spec_cam):
+			var e := _spec_cam.global_transform.basis.get_euler()
+			_spec_freefly_yaw = e.y
+			_spec_freefly_pitch = clamp(e.x, -1.4, 1.4)
+		_spec_mode = SPEC_MODE_FREEFLY
+	_spec_refresh_buttons()
+
+
+func _on_spec_prev_pressed() -> void:
+	_spec_cycle(-1)
+
+
+func _on_spec_next_pressed() -> void:
+	_spec_cycle(1)
 
 
 func _resolve_forklift_crate_manager(player_node: Node) -> Node:
@@ -2427,6 +3003,13 @@ func _collect_rigidbodies(n: Node, center: Vector3, budget: Array, acc: Array) -
 func _input(event: InputEvent) -> void:
 	if _lobby_cam_override_active and event is InputEventMouseMotion and _lobby_look_held():
 		_lobby_mouse_rel += (event as InputEventMouseMotion).relative
+
+	# Free-fly look: while spectating in free-fly with the right mouse button held (mouse captured).
+	if _spec_engaged and _spec_mode == SPEC_MODE_FREEFLY and _spec_grabbed_mouse and event is InputEventMouseMotion:
+		var mm := event as InputEventMouseMotion
+		_spec_freefly_yaw -= mm.relative.x * SPEC_FREEFLY_LOOK
+		_spec_freefly_pitch = clamp(_spec_freefly_pitch - mm.relative.y * SPEC_FREEFLY_LOOK, -1.4, 1.4)
+		return
 
 	if not enabled or _player == null or not is_instance_valid(_player):
 		return
@@ -2643,6 +3226,7 @@ func _rescan_player() -> void:
 			_head_bone_idx = -1
 			_movement_rotate_active = false
 			_ever_active = false
+			_spec_spawn_captured = false  # left the minigame -- re-capture spawn next match
 		return
 
 	var my_id := multiplayer.get_unique_id()
@@ -2691,6 +3275,11 @@ func _rescan_player() -> void:
 		_visuals = _direct_child_ancestor(_player, _skeleton) as Node3D
 		_head_original_scale = _skeleton.get_bone_pose_scale(_head_bone_idx)
 		_snap_head_smoothing = true  # new skeleton entirely -- jump to its head, don't glide there
+
+		# Remember where we spawned this match -- the free-fly cam starts here.
+		if not _spec_spawn_captured and _player is Node3D:
+			_spec_spawn_pos = (_player as Node3D).global_position + Vector3(0.0, 1.4, 0.0)
+			_spec_spawn_captured = true
 
 		if is_same_player:
 			print("[fpv_mod] player '", player_node.name, "' switched active armature -- now tracking ", _skeleton.get_path())
