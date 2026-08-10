@@ -221,7 +221,7 @@ var mod_dir: String = ""                             # set by main.gd -- where t
 const RECIPE_ANIM_FPS := 3.0                         # recipe sprite animation speed
 const RECIPE_FRAME_PX := 96                          # downscale target: pixels per animation frame
 const RED_STROBE_SPEED := 3.2                        # slow strobe of the red light under the pending item
-const GUN_RELOAD_FLASH_HZ := 6.5                     # gun sprite red<->regular flash rate while reloading
+const GUN_RELOAD_FLASH_PERIOD := 0.5                 # gun sprite stays each of red/regular for this long
 # Each item's sprite SHEET: file + grid (cols x rows), frames read row-major.
 const RECIPE_ITEM_SHEETS := {
 	1: {"file": "gear.png", "cols": 4, "rows": 4},
@@ -1654,8 +1654,8 @@ func _draw_gun_bar(ci: Control) -> void:
 	var w: float = ci.size.x
 	var h: float = ci.size.y
 	var reloading: bool = _recipe_gun_reloading
-	# Black background = same as the gun sprite's own background, so the sprite blends seamlessly.
-	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.0, 0.0, 0.0, 0.94))
+	# OPAQUE black background = exactly the gun sprite's own background, so no visible box edge.
+	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.0, 0.0, 0.0, 1.0))
 	# Thin red outline (gently pulsing).
 	var pulse: float = 0.68 + 0.32 * (0.5 + 0.5 * sin(_recipe_anim_time * RED_STROBE_SPEED))
 	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.85, 0.12, 0.1, pulse), false, 2.0)
@@ -1664,10 +1664,10 @@ func _draw_gun_bar(ci: Control) -> void:
 	if _recipe_gun_tex != null:
 		var frame: int = 0
 		if reloading:
-			frame = int(_recipe_anim_time * GUN_RELOAD_FLASH_HZ * 2.0) % 2
+			frame = int(_recipe_anim_time / GUN_RELOAD_FLASH_PERIOD) % 2  # 0.5s on each
 		var fw: float = float(_recipe_gun_tex.get_width()) * 0.5
 		var fh: float = float(_recipe_gun_tex.get_height())
-		var ginset: float = 10.0  # trim each frame's edges so the neighbouring frame doesn't bleed in
+		var ginset: float = 2.0  # frames are aligned + same size now; tiny inset only
 		var sw: float = fw - ginset * 2.0
 		var src := Rect2(float(frame) * fw + ginset, 0.0, sw, fh)
 		var scale: float = minf((w * 0.96) / sw, (h * 0.66) / fh)
@@ -3099,6 +3099,8 @@ func _spec_pick_target() -> void:
 
 
 func _spec_cycle(dir: int) -> void:
+	if _spec_mg_is("train"):
+		return  # Train Hazard: selective spectating disabled
 	_spec_build_targets()
 	if _spec_targets.is_empty():
 		return
@@ -3152,6 +3154,18 @@ func _spec_update_third() -> void:
 
 	if _spec_cam != null and is_instance_valid(_spec_cam) and _spec_cam.current:
 		_spec_cam.current = false
+
+	# Train Hazard: selective spectating is off, so 3rd-person is simply the game's OWN default spectate
+	# camera (no player-following, no re-centring).
+	if _spec_mg_is("train"):
+		var tc0 := _find_game_camera(true)
+		if tc0 == null and _orig_camera != null and is_instance_valid(_orig_camera):
+			tc0 = _orig_camera
+		if tc0 == null:
+			tc0 = _find_fallback_camera()
+		if tc0 != null and is_instance_valid(tc0) and not tc0.current:
+			tc0.current = true
+		return
 
 	# (A) Duck Hunt: it follows minigame.spectate_player. We run AFTER its _process (priority 4096), so
 	# writing spectate_player to our target every frame makes the arrows control it AND overrides any
@@ -3218,6 +3232,12 @@ func _spec_update_hunter(t: Node) -> void:
 	var reticle = t.get_node_or_null("HunterCanvasLayer/Control")  # scope overlay, alpha-0 by default
 	if reticle is CanvasItem:
 		(reticle as CanvasItem).modulate.a = 1.0 if scoped else 0.0
+	# The first-person viewmodel (arms/gun, render layer 16) is lit only by its own OmniLight, which the
+	# game keeps at energy 0 except during the muzzle-flash animation -- and that animation never runs on
+	# a remote client, so the arms/gun render pitch-black. Turn the light on while we spectate.
+	var omni = hc.get_node_or_null("WeaponParent/OmniLight3D")
+	if omni != null and "light_energy" in omni:
+		omni.set("light_energy", 3.0)
 
 
 func _spec_hunter_scoped(hc: Camera3D) -> bool:
@@ -3238,6 +3258,9 @@ func _spec_hunter_restore() -> void:
 			var lp = (hcam as Camera3D).get_node_or_null("LaserParent")
 			if lp is Node3D:
 				(lp as Node3D).visible = true
+			var omni = (hcam as Camera3D).get_node_or_null("WeaponParent/OmniLight3D")
+			if omni != null and "light_energy" in omni:
+				omni.set("light_energy", 0.0)  # back to the scene default
 		var reticle = _spec_hunter_ref.get_node_or_null("HunterCanvasLayer/Control")
 		if reticle is CanvasItem:
 			(reticle as CanvasItem).modulate.a = 0.0
@@ -3504,6 +3527,7 @@ func _spec_update_ui() -> void:
 		_spec_refresh_buttons()
 
 	var in_chisel := _spec_mg_is("chisel")
+	var in_train := _spec_mg_is("train")  # Train Hazard: no selective spectating (no cycle arrows)
 	var on_hunter: bool = _spec_target != null and is_instance_valid(_spec_target) and _spec_role_for(_spec_target) == "HUNTER"
 	if _spec_look_hint:
 		_spec_look_hint.visible = _spec_mode == SPEC_MODE_FPV and not in_chisel and not on_hunter
@@ -3539,9 +3563,9 @@ func _spec_update_ui() -> void:
 			_spec_role_label.visible = true
 		return
 	if _spec_prev_btn:
-		_spec_prev_btn.visible = true
+		_spec_prev_btn.visible = not in_train
 	if _spec_next_btn:
-		_spec_next_btn.visible = true
+		_spec_next_btn.visible = not in_train
 	if _spec_target != null and is_instance_valid(_spec_target):
 		if _spec_name_label:
 			_spec_name_label.text = _spec_name_of(_spec_target)
