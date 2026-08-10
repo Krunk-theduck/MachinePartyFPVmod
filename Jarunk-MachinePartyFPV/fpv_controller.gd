@@ -218,19 +218,25 @@ var _recipe_seq: PackedInt32Array = PackedInt32Array()  # ordered item ids (1..5
 var _recipe_index: int = -1                          # current step / done-count; steps before it are fulfilled
 var _recipe_done: bool = false                       # gun fully assembled
 var mod_dir: String = ""                             # set by main.gd -- where the mod (and its textures) live
-const RECIPE_ANIM_FPS := 12.0                        # recipe sprite animation speed
-const RECIPE_FRAME_PX := 56                          # downscale target: pixels per animation frame
+const RECIPE_ANIM_FPS := 3.0                         # recipe sprite animation speed
+const RECIPE_FRAME_PX := 96                          # downscale target: pixels per animation frame
+const RED_STROBE_SPEED := 3.2                        # slow strobe of the red light under the pending item
 # Each item's sprite SHEET: file + grid (cols x rows), frames read row-major.
 const RECIPE_ITEM_SHEETS := {
-	1: {"file": "gear.png", "cols": 4, "rows": 4},
-	2: {"file": "pipe.png", "cols": 8, "rows": 5},
-	3: {"file": "glue.png", "cols": 2, "rows": 2},
-	4: {"file": "strapped.png", "cols": 4, "rows": 4},
-	5: {"file": "spring.png", "cols": 4, "rows": 2},
+	1: {"file": "gear.png", "cols": 2, "rows": 2},
+	2: {"file": "pipe.png", "cols": 2, "rows": 1},
+	3: {"file": "glue.png", "cols": 2, "rows": 1},
+	4: {"file": "strapped.png", "cols": 2, "rows": 2},
+	5: {"file": "spring.png", "cols": 2, "rows": 2},
 }
-var _recipe_tex_grey: Dictionary = {}                # item_id -> greyscale sheet Texture2D (tinted green/grey)
+var _recipe_tex: Dictionary = {}                     # item_id -> full-colour sheet (drawn while pending)
+var _recipe_tex_grey: Dictionary = {}                # item_id -> greyscale sheet (drawn once fulfilled)
 var _recipe_frozen: Dictionary = {}                  # slot index -> true once its anim has parked at frame 0
 var _recipe_anim_time: float = 0.0
+var _recipe_gun_tex: Texture2D = null                # gun.png: 2 frames (ready | reloading), drawn on the bar
+var _recipe_gun_mode: bool = false                   # local player is holding the built gun -> special bar
+var _recipe_gun_reloading: bool = false
+var _recipe_gun_reload_frac: float = 1.0             # 0..1 reload progress
 
 # --- Spectator system (engages only once we've released to spectate; never touches live play) ---
 const SPEC_MODE_THIRD := 0
@@ -1565,6 +1571,17 @@ func _update_recipe_hud() -> void:
 	if _player_class_name != &"ManufactureGunPlayer" or _player == null or not is_instance_valid(_player):
 		_recipe_hud.visible = false
 		return
+	# Once the LOCAL player has built & is holding the gun, swap the recipe bar for the special gun bar.
+	if "has_gun" in _player and bool(_player.get("has_gun")):
+		_recipe_gun_mode = true
+		var cd: float = float(_player.get("shoot_cooldown_timer")) if "shoot_cooldown_timer" in _player else 0.0
+		var maxcd: float = float(_player.get("shoot_cooldown")) if "shoot_cooldown" in _player else 3.0
+		_recipe_gun_reloading = cd > 0.0
+		_recipe_gun_reload_frac = clampf(1.0 - cd / maxf(maxcd, 0.01), 0.0, 1.0)
+		_recipe_hud.visible = true
+		_recipe_hud.queue_redraw()
+		return
+	_recipe_gun_mode = false
 	if not ("game_instance" in _player):
 		_recipe_hud.visible = false
 		return
@@ -1592,6 +1609,9 @@ func _draw_recipe_hud() -> void:
 	# grey pixel art; finished steps show it in solid real colour; later steps stay hidden (revealed one
 	# at a time, like the in-world holo recipe).
 	var ci: Control = _recipe_hud
+	if _recipe_gun_mode:
+		_draw_gun_bar(ci)
+		return
 	var n: int = _recipe_seq.size()
 	if n <= 0:
 		return
@@ -1613,7 +1633,45 @@ func _draw_recipe_hud() -> void:
 			_draw_recipe_item(ci, i, _recipe_seq[i], r, true)
 		elif i == _recipe_index:
 			_draw_recipe_item(ci, i, _recipe_seq[i], r, false)
+			_draw_recipe_red_bar(ci, r)  # slow strobing red light under the item you still need
 		# later steps: leave the slot empty (revealed one at a time)
+
+
+func _draw_recipe_red_bar(ci: Control, r: Rect2) -> void:
+	var t: float = 0.5 + 0.5 * sin(_recipe_anim_time * RED_STROBE_SPEED)  # 0..1, slow
+	var a: float = lerpf(0.22, 0.9, t)
+	var bh: float = 5.0
+	var y: float = r.position.y + r.size.y - bh - 1.0
+	var x: float = r.position.x + 3.0
+	var bw: float = r.size.x - 6.0
+	ci.draw_rect(Rect2(x - 2.0, y - 2.0, bw + 4.0, bh + 4.0), Color(0.9, 0.1, 0.05, a * 0.35))  # glow
+	ci.draw_rect(Rect2(x, y, bw, bh), Color(0.85, 0.12, 0.08, a))                                # core
+	ci.draw_rect(Rect2(x, y + bh * 0.32, bw, bh * 0.32), Color(1.0, 0.55, 0.45, a))              # hot centre
+
+
+func _draw_gun_bar(ci: Control) -> void:
+	var w: float = ci.size.x
+	var h: float = ci.size.y
+	var reloading: bool = _recipe_gun_reloading
+	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.05, 0.045, 0.035, 0.9))
+	var border: Color = Color(0.98, 0.5, 0.15, 0.95) if reloading else Color(0.9, 0.72, 0.28, 0.95)
+	ci.draw_rect(Rect2(0.0, 0.0, w, h), border, false, 2.5)
+	if _recipe_gun_tex != null:
+		var frame: int = 1 if reloading else 0   # frame 0 = plain (ready), frame 1 = red-lit (reloading)
+		var fw: float = float(_recipe_gun_tex.get_width()) * 0.5
+		var fh: float = float(_recipe_gun_tex.get_height())
+		var src := Rect2(float(frame) * fw, 0.0, fw, fh)
+		var scale: float = minf((w * 0.9) / fw, (h * 0.60) / fh)
+		var dw: float = fw * scale
+		var dh: float = fh * scale
+		ci.draw_texture_rect_region(_recipe_gun_tex, Rect2((w - dw) * 0.5, 3.0, dw, dh), src, Color(1, 1, 1, 1))
+	var label: String = "RELOADING" if reloading else "READY"
+	var col: Color = Color(0.98, 0.55, 0.2) if reloading else Color(0.45, 0.95, 0.5)
+	var font: Font = _spec_font if _spec_font != null else ThemeDB.fallback_font
+	ci.draw_string(font, Vector2(0.0, h - 8.0), label, HORIZONTAL_ALIGNMENT_CENTER, w, 15, col)
+	if reloading:
+		ci.draw_rect(Rect2(8.0, h - 4.0, w - 16.0, 2.0), Color(0.2, 0.2, 0.2, 0.8))
+		ci.draw_rect(Rect2(8.0, h - 4.0, (w - 16.0) * _recipe_gun_reload_frac, 2.0), Color(0.98, 0.6, 0.2, 0.95))
 
 
 func _recipe_col(c: Color, solid: bool) -> Color:
@@ -1631,17 +1689,18 @@ func _load_recipe_textures() -> void:
 	var loaded: int = 0
 	for item_id in RECIPE_ITEM_SHEETS:
 		var cfg: Dictionary = RECIPE_ITEM_SHEETS[item_id]
-		var grey := _load_recipe_grey(String(cfg["file"]), int(cfg["cols"]))
-		if grey != null:
-			_recipe_tex_grey[item_id] = grey
+		var img := _load_recipe_img(String(cfg["file"]), int(cfg["cols"]))
+		if img != null:
+			_recipe_tex[item_id] = ImageTexture.create_from_image(img)   # full colour (pending)
+			_recipe_tex_grey[item_id] = _greyscale_texture(img)          # grey (fulfilled)
 			loaded += 1
-	print("[fpv_mod] recipe sprites loaded: ", loaded, "/", RECIPE_ITEM_SHEETS.size(),
-		" from ", mod_dir.path_join("textures/recipe"))
+	var gun_img := _load_recipe_img("gun.png", 3)  # 2 frames; kept in colour, drawn on the dark gun bar
+	if gun_img != null:
+		_recipe_gun_tex = ImageTexture.create_from_image(gun_img)
+	print("[fpv_mod] recipe sprites loaded: ", loaded, "/", RECIPE_ITEM_SHEETS.size(), " gun=", _recipe_gun_tex != null)
 
 
-func _load_recipe_grey(fname: String, cols: int) -> Texture2D:
-	# Load the sheet, downscale so each column is ~RECIPE_FRAME_PX wide, then convert to greyscale (both
-	# the green pending tint and the grey fulfilled tint come from modulating this one greyscale sheet).
+func _load_recipe_img(fname: String, cols: int) -> Image:
 	var path: String = mod_dir.path_join("textures").path_join("recipe").path_join(fname)
 	var img := Image.new()
 	if img.load(path) != OK:
@@ -1651,7 +1710,11 @@ func _load_recipe_grey(fname: String, cols: int) -> Texture2D:
 	img.resize(tw, maxi(th, 1), Image.INTERPOLATE_LANCZOS)
 	if img.get_format() != Image.FORMAT_RGBA8:
 		img.convert(Image.FORMAT_RGBA8)
-	var data: PackedByteArray = img.get_data()
+	return img
+
+
+func _greyscale_texture(src: Image) -> Texture2D:
+	var data: PackedByteArray = src.get_data()  # a copy
 	var i: int = 0
 	var n: int = data.size()
 	while i + 3 < n:
@@ -1660,7 +1723,7 @@ func _load_recipe_grey(fname: String, cols: int) -> Texture2D:
 		data[i + 1] = l
 		data[i + 2] = l
 		i += 4
-	var out := Image.create_from_data(img.get_width(), img.get_height(), false, Image.FORMAT_RGBA8, data)
+	var out := Image.create_from_data(src.get_width(), src.get_height(), false, Image.FORMAT_RGBA8, data)
 	return ImageTexture.create_from_image(out)
 
 
@@ -1679,7 +1742,8 @@ func _draw_recipe_item(ci: Control, slot: int, item_id: int, r: Rect2, fulfilled
 
 
 func _draw_recipe_sprite(ci: Control, slot: int, item_id: int, r: Rect2, fulfilled: bool) -> bool:
-	var tex: Texture2D = _recipe_tex_grey.get(item_id)
+	# Pending item = full colour; fulfilled = translucent greyscale.
+	var tex: Texture2D = _recipe_tex_grey.get(item_id) if fulfilled else _recipe_tex.get(item_id)
 	if tex == null or not RECIPE_ITEM_SHEETS.has(item_id):
 		return false
 	var cfg: Dictionary = RECIPE_ITEM_SHEETS[item_id]
@@ -1704,8 +1768,7 @@ func _draw_recipe_sprite(ci: Control, slot: int, item_id: int, r: Rect2, fulfill
 	var fh: float = float(tex.get_height()) / float(rows)
 	var inset: float = 1.0
 	var src := Rect2(float(frame % cols) * fw + inset, float(frame / cols) * fh + inset, fw - inset * 2.0, fh - inset * 2.0)
-	# Pending = translucent green; fulfilled = translucent grey.
-	var tint: Color = Color(0.85, 0.86, 0.9, 0.5) if fulfilled else Color(0.32, 0.95, 0.46, 0.66)
+	var tint: Color = Color(0.85, 0.86, 0.9, 0.45) if fulfilled else Color(1.0, 1.0, 1.0, 1.0)
 	var scale: float = minf(r.size.x / fw, r.size.y / fh) * 1.06
 	var dw: float = fw * scale
 	var dh: float = fh * scale
