@@ -3566,6 +3566,17 @@ func _spec_update_ui() -> void:
 		_spec_prev_btn.visible = not in_train
 	if _spec_next_btn:
 		_spec_next_btn.visible = not in_train
+	# Train Hazard: no player to name -- just a centred "Default View" label.
+	if in_train:
+		if _spec_name_label:
+			_spec_name_label.text = "Default View"
+			_spec_name_label.offset_left = 0
+			_spec_name_label.offset_right = 0
+			_spec_name_label.offset_top = 2
+			_spec_name_label.offset_bottom = 58
+		if _spec_role_label:
+			_spec_role_label.visible = false
+		return
 	if _spec_target != null and is_instance_valid(_spec_target):
 		if _spec_name_label:
 			_spec_name_label.text = _spec_name_of(_spec_target)
