@@ -218,10 +218,18 @@ var _recipe_seq: PackedInt32Array = PackedInt32Array()  # ordered item ids (1..5
 var _recipe_index: int = -1                          # current step / done-count; steps before it are fulfilled
 var _recipe_done: bool = false                       # gun fully assembled
 var mod_dir: String = ""                             # set by main.gd -- where the mod (and its textures) live
-const RECIPE_ANIM_FPS := 8.0                         # recipe sprite animation speed (2x2 = 4 frames)
-const RECIPE_ITEM_FILES := {1: "gear.png", 2: "pipe.png", 3: "glue.png", 4: "strapped.png", 5: "spring.png"}
-var _recipe_tex: Dictionary = {}                     # item_id -> full-colour animated sprite sheet Texture2D
-var _recipe_tex_grey: Dictionary = {}                # item_id -> greyscale copy (drawn once fulfilled)
+const RECIPE_ANIM_FPS := 12.0                        # recipe sprite animation speed
+const RECIPE_FRAME_PX := 56                          # downscale target: pixels per animation frame
+# Each item's sprite SHEET: file + grid (cols x rows), frames read row-major.
+const RECIPE_ITEM_SHEETS := {
+	1: {"file": "gear.png", "cols": 4, "rows": 4},
+	2: {"file": "pipe.png", "cols": 8, "rows": 5},
+	3: {"file": "glue.png", "cols": 2, "rows": 2},
+	4: {"file": "strapped.png", "cols": 4, "rows": 4},
+	5: {"file": "spring.png", "cols": 4, "rows": 2},
+}
+var _recipe_tex_grey: Dictionary = {}                # item_id -> greyscale sheet Texture2D (tinted green/grey)
+var _recipe_frozen: Dictionary = {}                  # slot index -> true once its anim has parked at frame 0
 var _recipe_anim_time: float = 0.0
 
 # --- Spectator system (engages only once we've released to spectate; never touches live play) ---
@@ -1602,9 +1610,9 @@ func _draw_recipe_hud() -> void:
 		ci.draw_rect(r, Color(0.30, 0.30, 0.34, 1.0), false, 2.0)
 		var fulfilled: bool = (i < _recipe_index) or _recipe_done
 		if fulfilled:
-			_draw_recipe_item(ci, _recipe_seq[i], r, true)
+			_draw_recipe_item(ci, i, _recipe_seq[i], r, true)
 		elif i == _recipe_index:
-			_draw_recipe_item(ci, _recipe_seq[i], r, false)
+			_draw_recipe_item(ci, i, _recipe_seq[i], r, false)
 		# later steps: leave the slot empty (revealed one at a time)
 
 
@@ -1620,31 +1628,27 @@ func _load_recipe_textures() -> void:
 	if mod_dir == "":
 		print("[fpv_mod] recipe textures: mod_dir not set -- using drawn icons")
 		return
-	for item_id in RECIPE_ITEM_FILES:
-		var tex := _load_recipe_image(String(RECIPE_ITEM_FILES[item_id]))
-		if tex != null:
-			_recipe_tex[item_id] = tex
-			var grey := _greyscale_texture(tex)
-			if grey != null:
-				_recipe_tex_grey[item_id] = grey
-	print("[fpv_mod] recipe sprites loaded: ", _recipe_tex.size(), "/", RECIPE_ITEM_FILES.size(),
+	var loaded: int = 0
+	for item_id in RECIPE_ITEM_SHEETS:
+		var cfg: Dictionary = RECIPE_ITEM_SHEETS[item_id]
+		var grey := _load_recipe_grey(String(cfg["file"]), int(cfg["cols"]))
+		if grey != null:
+			_recipe_tex_grey[item_id] = grey
+			loaded += 1
+	print("[fpv_mod] recipe sprites loaded: ", loaded, "/", RECIPE_ITEM_SHEETS.size(),
 		" from ", mod_dir.path_join("textures/recipe"))
 
 
-func _load_recipe_image(fname: String) -> Texture2D:
+func _load_recipe_grey(fname: String, cols: int) -> Texture2D:
+	# Load the sheet, downscale so each column is ~RECIPE_FRAME_PX wide, then convert to greyscale (both
+	# the green pending tint and the grey fulfilled tint come from modulating this one greyscale sheet).
 	var path: String = mod_dir.path_join("textures").path_join("recipe").path_join(fname)
 	var img := Image.new()
 	if img.load(path) != OK:
 		return null
-	# Downscale -- the icons draw ~40px, and it keeps the one-time greyscale pass cheap.
-	var tw: int = 128
-	var th: int = int(round(128.0 * float(img.get_height()) / float(img.get_width())))
+	var tw: int = maxi(cols, 1) * RECIPE_FRAME_PX
+	var th: int = int(round(float(tw) * float(img.get_height()) / float(img.get_width())))
 	img.resize(tw, maxi(th, 1), Image.INTERPOLATE_LANCZOS)
-	return ImageTexture.create_from_image(img)
-
-
-func _greyscale_texture(tex: Texture2D) -> Texture2D:
-	var img: Image = tex.get_image().duplicate()
 	if img.get_format() != Image.FORMAT_RGBA8:
 		img.convert(Image.FORMAT_RGBA8)
 	var data: PackedByteArray = img.get_data()
@@ -1660,37 +1664,54 @@ func _greyscale_texture(tex: Texture2D) -> Texture2D:
 	return ImageTexture.create_from_image(out)
 
 
-func _draw_recipe_item(ci: Control, item_id: int, r: Rect2, solid: bool) -> void:
-	# solid == true means the step is FULFILLED (translucent grey); false means CURRENT (semi-transparent
-	# colour). Animated sprite if the texture is present, else the drawn-icon fallback.
-	if _draw_recipe_sprite(ci, item_id, r, solid):
+func _draw_recipe_item(ci: Control, slot: int, item_id: int, r: Rect2, fulfilled: bool) -> void:
+	if _draw_recipe_sprite(ci, slot, item_id, r, fulfilled):
 		return
+	# Fallback (texture missing): the old drawn icons.
 	var c: Vector2 = r.get_center()
-	var s: float = minf(r.size.x, r.size.y) * 0.40  # icon half-size
+	var s: float = minf(r.size.x, r.size.y) * 0.40
 	match item_id:
-		1: _draw_item_gear(ci, c, s, solid)
-		2: _draw_item_pipe(ci, c, s, solid)
-		3: _draw_item_glue(ci, c, s, solid)
-		4: _draw_item_strapped(ci, c, s, solid)
-		5: _draw_item_spring(ci, c, s, solid)
+		1: _draw_item_gear(ci, c, s, fulfilled)
+		2: _draw_item_pipe(ci, c, s, fulfilled)
+		3: _draw_item_glue(ci, c, s, fulfilled)
+		4: _draw_item_strapped(ci, c, s, fulfilled)
+		5: _draw_item_spring(ci, c, s, fulfilled)
 
 
-func _draw_recipe_sprite(ci: Control, item_id: int, r: Rect2, fulfilled: bool) -> bool:
-	var tex: Texture2D = _recipe_tex_grey.get(item_id) if fulfilled else _recipe_tex.get(item_id)
-	if tex == null:
+func _draw_recipe_sprite(ci: Control, slot: int, item_id: int, r: Rect2, fulfilled: bool) -> bool:
+	var tex: Texture2D = _recipe_tex_grey.get(item_id)
+	if tex == null or not RECIPE_ITEM_SHEETS.has(item_id):
 		return false
-	var alpha: float = 0.45 if fulfilled else 0.62
-	var fw: float = float(tex.get_width()) * 0.5   # 2x2 sheet -> frame is half the size
-	var fh: float = float(tex.get_height()) * 0.5
-	var frame: int = int(_recipe_anim_time * RECIPE_ANIM_FPS) % 4
-	var inset: float = 1.0  # trim any baked grid line at the frame seam
-	var src := Rect2(float(frame % 2) * fw + inset, float(frame / 2) * fh + inset, fw - inset * 2.0, fh - inset * 2.0)
-	var scale: float = minf(r.size.x / fw, r.size.y / fh) * 0.98
+	var cfg: Dictionary = RECIPE_ITEM_SHEETS[item_id]
+	var cols: int = int(cfg["cols"])
+	var rows: int = int(cfg["rows"])
+	var frames: int = maxi(cols * rows, 1)
+	var anim_frame: int = int(_recipe_anim_time * RECIPE_ANIM_FPS) % frames
+
+	# Freeze-on-fulfill: a pending item loops; the instant it's fulfilled it keeps playing until the
+	# animation next reaches the START frame (0), then parks there.
+	var frame: int = anim_frame
+	if fulfilled:
+		if bool(_recipe_frozen.get(slot, false)):
+			frame = 0
+		elif anim_frame == 0:
+			_recipe_frozen[slot] = true
+			frame = 0
+	else:
+		_recipe_frozen.erase(slot)
+
+	var fw: float = float(tex.get_width()) / float(cols)
+	var fh: float = float(tex.get_height()) / float(rows)
+	var inset: float = 1.0
+	var src := Rect2(float(frame % cols) * fw + inset, float(frame / cols) * fh + inset, fw - inset * 2.0, fh - inset * 2.0)
+	# Pending = translucent green; fulfilled = translucent grey.
+	var tint: Color = Color(0.85, 0.86, 0.9, 0.5) if fulfilled else Color(0.32, 0.95, 0.46, 0.66)
+	var scale: float = minf(r.size.x / fw, r.size.y / fh) * 1.06
 	var dw: float = fw * scale
 	var dh: float = fh * scale
 	var cen: Vector2 = r.get_center()
 	var dest := Rect2(cen.x - dw * 0.5, cen.y - dh * 0.5, dw, dh)
-	ci.draw_texture_rect_region(tex, dest, src, Color(1.0, 1.0, 1.0, alpha))
+	ci.draw_texture_rect_region(tex, dest, src, tint)
 	return true
 
 
@@ -4013,6 +4034,7 @@ func _rescan_player() -> void:
 		_recipe_seq = PackedInt32Array()
 		_recipe_index = -1
 		_recipe_done = false
+		_recipe_frozen.clear()
 		if _player_class_name == &"SmokeBreakPlayer" and "anim_handler" in player_node:
 			var anim_h = player_node.get("anim_handler")
 			if anim_h and is_instance_valid(anim_h) and "cig_scale_parent" in anim_h:
