@@ -135,17 +135,19 @@ const GUN_WALL_CLOSER := 1.6  # shift the copied wall this much toward the play 
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
-# --- Smoke Break: add a 3rd wall on the open side to the player's right (visual only). We lift the BACK
-# wall's triangles + its wall props out of the shell and rotate them 180deg about the room centre so they
-# land on the open FRONT side, facing inward. A proper rotation keeps normals/winding correct (unlike the
-# gun-wall reflection), so the new wall lights exactly like the real ones. Build-once, then it persists.
+# --- Smoke Break: add a 3rd wall on an open side (visual only, hidden when FPV is off). We copy the
+# feature-rich wall behind the player -- the +X wall with its maintenance-hatch DOORS/holes and radiators
+# -- and rotate it 180deg about the room centre so the whole thing (shell + props) lands on the opposite
+# open side (-X), facing inward. A proper rotation keeps normals/winding correct (unlike the gun-wall
+# reflection), so it lights like the real walls. Build-once, then it persists (visibility follows FPV).
 const SMOKE_WALL_ENABLED := true
 const SMOKE_WALL_ART_ROOT := "smoke break near final3"
 const SMOKE_WALL_SHELL_MESH := "base mesh"      # the room shell (floor/ceiling/walls baked as one mesh)
 const SMOKE_WALL_GROUP_NAME := "fpv_added_wall"
 const SMOKE_ROOM_CENTER := Vector3(-0.5, 3.8, -0.5)  # from RoomCollision (size 11 x 7.4 x 11)
-const SMOKE_WALL_ZCUT := 4.3    # keep shell triangles past this Z -- the back wall plane (~Z 5)
-const SMOKE_WALL_ZMAX := 6.2    # ...but not the far "void" backdrop behind it
+const SMOKE_WALL_CUT := 4.3     # keep shell triangles past this X -- the +X wall plane (~X 5)
+const SMOKE_WALL_MAX := 6.2     # ...but nothing further out than the wall itself
+const SMOKE_PROP_MIN := 4.3     # wall-mounted props to carry along (hatches ~5.25, radiators ~4.64)
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -238,11 +240,11 @@ const RED_STROBE_SPEED := 3.2                        # slow strobe of the red li
 const GUN_RELOAD_FLASH_PERIOD := 0.5                 # gun sprite stays each of red/regular for this long
 # Each item's sprite SHEET: file + grid (cols x rows), frames read row-major.
 const RECIPE_ITEM_SHEETS := {
-	1: {"file": "gear.png", "cols": 4, "rows": 4},  # 16 hand-drawn frames, baked to step clockwise
+	1: {"file": "gear.png", "cols": 4, "rows": 4, "fps": 4.5},  # 16 hand-drawn frames, baked to step clockwise
 	2: {"file": "pipe.png", "cols": 2, "rows": 1},
 	3: {"file": "glue.png", "cols": 2, "rows": 1},
 	4: {"file": "strapped.png", "cols": 2, "rows": 2},
-	5: {"file": "spring.png", "cols": 4, "rows": 2},
+	5: {"file": "spring.png", "cols": 4, "rows": 2, "fps": 6.0},
 }
 var _recipe_tex: Dictionary = {}                     # item_id -> full-colour sheet (drawn while pending)
 var _recipe_tex_grey: Dictionary = {}                # item_id -> greyscale sheet (drawn once fulfilled)
@@ -262,6 +264,7 @@ const SPEC_FREEFLY_LOOK := 0.0035   # free-fly mouse look sensitivity (rad/pixel
 const SPEC_FREEFLY_PAD_LOOK := 2.8  # free-fly controller right-stick look (rad/sec at full tilt)
 const SPEC_PAD_MOVE_DEADZONE := 0.18
 const SPEC_HEAD_SMOOTHING := 20.0   # FPV-spectate head follow rate (tight but de-jittered)
+const SPEC_THIRD_FOLLOW_SMOOTH := 15.0  # 3rd-person shared-cam follow-point smoothing (de-jitters bots)
 const SPEC_THIRD_ZOOM := 0.82       # shared-cam 3rd-person: pull in a bit vs the game's wide overview framing
 var _spec_engaged: bool = false     # my spectate system is active (I'm dead + spectating a live round)
 var _spec_mode: int = SPEC_MODE_THIRD  # third-person is the default
@@ -286,6 +289,7 @@ var _spec_spawn_captured: bool = false
 var _spec_grabbed_mouse: bool = false         # we captured the mouse for free-fly look
 var _spec_mg: Node = null                     # the minigame we're spectating (captured at engage)
 var _spec_smoothed_head: Vector3 = Vector3.ZERO  # FPV-spectate head smoothing (mirrors real FPV)
+var _spec_smoothed_subj: Vector3 = Vector3.ZERO  # 3rd-person shared-cam follow-point smoothing
 var _spec_snap_head: bool = false             # snap (don't glide) on target/mode change
 var _spec_hidden_skel: Skeleton3D = null      # the spectated skeleton whose head we're hiding
 var _spec_hidden_idx: int = -1
@@ -1767,7 +1771,7 @@ func _draw_recipe_item(ci: Control, slot: int, item_id: int, r: Rect2, fulfilled
 		5: _draw_item_spring(ci, c, s, fulfilled)
 
 
-func _draw_recipe_sprite(ci: Control, slot: int, item_id: int, r: Rect2, fulfilled: bool) -> bool:
+func _draw_recipe_sprite(ci: Control, _slot: int, item_id: int, r: Rect2, fulfilled: bool) -> bool:
 	# Pending item = full colour; fulfilled = translucent greyscale.
 	var tex: Texture2D = _recipe_tex_grey.get(item_id) if fulfilled else _recipe_tex.get(item_id)
 	if tex == null or not RECIPE_ITEM_SHEETS.has(item_id):
@@ -1776,19 +1780,9 @@ func _draw_recipe_sprite(ci: Control, slot: int, item_id: int, r: Rect2, fulfill
 	var cols: int = int(cfg["cols"])
 	var rows: int = int(cfg["rows"])
 	var frames: int = maxi(cols * rows, 1)
-	var anim_frame: int = int(_recipe_anim_time * RECIPE_ANIM_FPS) % frames
-
-	# Freeze-on-fulfill: a pending item loops; the instant it's fulfilled it keeps playing until the
-	# animation next reaches the START frame (0), then parks there.
-	var frame: int = anim_frame
-	if fulfilled:
-		if bool(_recipe_frozen.get(slot, false)):
-			frame = 0
-		elif anim_frame == 0:
-			_recipe_frozen[slot] = true
-			frame = 0
-	else:
-		_recipe_frozen.erase(slot)
+	var fps: float = float(cfg.get("fps", RECIPE_ANIM_FPS))
+	# A pending item loops; the instant it's fulfilled it parks at its start frame (stops animating).
+	var frame: int = 0 if fulfilled else int(_recipe_anim_time * fps) % frames
 
 	var fw: float = float(tex.get_width()) / float(cols)
 	var fh: float = float(tex.get_height()) / float(rows)
@@ -2055,6 +2049,11 @@ func _process(delta: float) -> void:
 		if _gun_wall_clone != null and is_instance_valid(_gun_wall_clone):
 			_gun_wall_clone.queue_free()
 		_gun_wall_clone = null
+		if _smoke_wall_group != null and is_instance_valid(_smoke_wall_group):
+			_smoke_wall_group.visible = false  # FPV-off: the added smoke wall must not show
+		# Spectating is NOT exclusive to FPV: keep detecting death and running our name/arrows/free-cam/
+		# FPV-viewer spectate even with the FPV toggle off.
+		_spectate_track_while_fpv_off(delta)
 		return
 
 	_accum += delta
@@ -2345,6 +2344,16 @@ func _update_gun_wall(delta: float) -> void:
 		print("[fpv_mod] gun wall: copied ", kept, " tris (full depth, vert-reflected about x=", cx, ")")
 
 
+func _smoke_prop_ok(nm: String) -> bool:
+	# Bring wall-mounted fittings only -- skip the fan (own AnimationPlayer), timer, void backdrop, and
+	# anything light/blood/decal related.
+	var low := nm.to_lower()
+	for bad in ["fan", "timer", "blood", "void", "backdrop", "light", "decal"]:
+		if low.contains(bad):
+			return false
+	return true
+
+
 func _update_smoke_wall(_delta: float) -> void:
 	# Smoke Break only: add a third wall on the open side to the player's right by copying the BACK wall's
 	# shell triangles + its props and rotating them 180deg about the room centre onto the open front side.
@@ -2363,6 +2372,7 @@ func _update_smoke_wall(_delta: float) -> void:
 	var existing := art.get_node_or_null(NodePath(SMOKE_WALL_GROUP_NAME))
 	if existing is Node3D:
 		_smoke_wall_group = existing as Node3D
+		_smoke_wall_group.visible = true  # re-show if it was hidden while FPV was off
 		return
 	var shell := _find_mesh_named(art, SMOKE_WALL_SHELL_MESH, [SCAN_BUDGET])
 	if shell == null or shell.mesh == null:
@@ -2373,9 +2383,9 @@ func _update_smoke_wall(_delta: float) -> void:
 	var mesh := shell.mesh as ArrayMesh
 	if mesh == null:
 		return
-	# Build a submesh of just the back wall's vertical faces (Z-facing, past the Z cut), one SurfaceTool
+	# Build a submesh of just the +X wall's vertical faces (X-facing, past the X cut), one SurfaceTool
 	# per source surface so each keeps its own lit material. Floor/ceiling slivers are dropped by the
-	# normal test (they face +/-Y, not +/-Z).
+	# normal test (they face +/-Y, not +/-X).
 	var combined := ArrayMesh.new()
 	var kept_tris := 0
 	for s in mesh.get_surface_count():
@@ -2400,14 +2410,14 @@ func _update_smoke_wall(_delta: float) -> void:
 			var v0: Vector3 = verts[i0]
 			var v1: Vector3 = verts[i1]
 			var v2: Vector3 = verts[i2]
-			var cz := (v0.z + v1.z + v2.z) / 3.0
-			if cz < SMOKE_WALL_ZCUT or cz > SMOKE_WALL_ZMAX:
+			var cx := (v0.x + v1.x + v2.x) / 3.0
+			if cx < SMOKE_WALL_CUT or cx > SMOKE_WALL_MAX:
 				continue
 			var gn := (v1 - v0).cross(v2 - v0)  # geometric normal
 			if gn.length() < 0.000001:
 				continue
 			gn = gn.normalized()
-			if absf(gn.z) < 0.5:  # keep only Z-facing wall faces, not the floor/ceiling
+			if absf(gn.x) < 0.5:  # keep only X-facing wall faces, not the floor/ceiling
 				continue
 			for ii in [i0, i1, i2]:
 				if have_n:
@@ -2426,11 +2436,11 @@ func _update_smoke_wall(_delta: float) -> void:
 	if kept_tris == 0:
 		if not _smoke_wall_logged:
 			_smoke_wall_logged = true
-			print("[fpv_mod] smoke wall: no back-wall triangles matched")
+			print("[fpv_mod] smoke wall: no +X wall triangles matched")
 		return
 	# One group node carrying the 180deg-about-centre rotation. The wall submesh (base-mesh-local coords)
-	# and the copied props sit under it with their ORIGINAL local transforms, so the group swings them all
-	# onto the open front side together, correctly facing inward.
+	# and the copied wall props sit under it with their ORIGINAL local transforms, so the group swings the
+	# whole wall onto the opposite open side together, correctly facing inward.
 	var group := Node3D.new()
 	group.name = SMOKE_WALL_GROUP_NAME
 	art.add_child(group)
@@ -2441,11 +2451,18 @@ func _update_smoke_wall(_delta: float) -> void:
 	wall.mesh = combined
 	wall.layers = shell.layers
 	group.add_child(wall)
-	# Just the bare wall (no props/signs/timer) -- like the gun-game wall.
+	# Carry the wall's own fittings along ("holes, doors and other things"): the maintenance-hatch doors
+	# and radiators mounted on this wall. Skip loose floor clutter and anything animated/lit/decal.
+	var props_copied := 0
+	for ch in shell.get_children():
+		if ch is MeshInstance3D and (ch as MeshInstance3D).transform.origin.x >= SMOKE_PROP_MIN and _smoke_prop_ok(String(ch.name)):
+			var dup := (ch as Node3D).duplicate()
+			group.add_child(dup)
+			props_copied += 1
 	_smoke_wall_group = group
 	if not _smoke_wall_logged:
 		_smoke_wall_logged = true
-		print("[fpv_mod] smoke wall: built (", kept_tris, " tris, bare)")
+		print("[fpv_mod] smoke wall: built (", kept_tris, " tris, ", props_copied, " props)")
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
@@ -2521,6 +2538,28 @@ func _class_from_skeleton_owner() -> StringName:
 				return gn
 		cur = cur.get_parent()
 	return &""
+
+
+func _spectate_track_while_fpv_off(delta: float) -> void:
+	# FPV toggle is OFF, but spectating is not FPV-exclusive. Detect a REAL death and hand straight to our
+	# 3rd-person spectate (no FPV death-cam ride); the top-of-_process drive then runs the names/arrows/
+	# free-cam/FPV-viewer every frame. Finished-but-alive players keep the normal game view.
+	if _spectating_released:
+		return  # already spectating -- _update_spectate handles it
+	_accum += delta
+	if _accum >= RESCAN_IV or _player == null or not is_instance_valid(_player):
+		_accum = 0.0
+		_rescan_player()
+	var have_rig := (_player != null and is_instance_valid(_player)
+		and _skeleton != null and is_instance_valid(_skeleton) and _head_bone_idx >= 0)
+	if not have_rig:
+		return
+	if _player_is_active():
+		_was_active = true
+		_ever_active = true
+		return
+	if _ever_active and not _finished_stay_fpv():
+		_spectate_release("death (fpv off)")
 
 
 func _process_death_cam(delta: float) -> void:
@@ -3319,7 +3358,13 @@ func _spec_update_third() -> void:
 			_spec_cam.current = true
 		var fwd: Vector3 = -base_basis.z
 		var subj: Vector3 = _spec_head_origin(t)
-		_spec_cam.global_transform = Transform3D(base_basis, subj - fwd * (_spec_shared_dist * SPEC_THIRD_ZOOM))
+		# Smooth the follow point so a bot's network-stuttered position doesn't jitter the cam. A player
+		# switch or teleport is a big jump, which the distance test snaps through instantly.
+		if _spec_smoothed_subj.distance_to(subj) > HEAD_TELEPORT_SNAP_DISTANCE:
+			_spec_smoothed_subj = subj
+		else:
+			_spec_smoothed_subj = _spec_smoothed_subj.lerp(subj, 1.0 - exp(-get_process_delta_time() * SPEC_THIRD_FOLLOW_SMOOTH))
+		_spec_cam.global_transform = Transform3D(base_basis, _spec_smoothed_subj - fwd * (_spec_shared_dist * SPEC_THIRD_ZOOM))
 		return
 
 	# Nothing to follow -> re-assert the game's own camera.
@@ -3453,8 +3498,10 @@ func _spec_update_fpv(delta: float) -> void:
 	# Head-bone eye position, smoothed exactly like real FPV (lateral/vertical eased, forward instant).
 	var head_xform: Transform3D = sk.global_transform * sk.get_bone_global_pose(idx)
 	var target_head: Vector3 = head_xform.origin + _spec_eye_offset(yaw)
-	var grounded: bool = not (t is CharacterBody3D) or (t as CharacterBody3D).is_on_floor()
-	if _spec_snap_head or not grounded or _spec_smoothed_head.distance_to(target_head) > HEAD_TELEPORT_SNAP_DISTANCE:
+	# Always smooth (only a genuine teleport or first frame snaps). We used to also snap while airborne,
+	# but bots frequently report is_on_floor()==false, which snapped to their raw network-stuttered head
+	# every frame -> heavy jitter. Full smoothing is what removes remote/bot stutter.
+	if _spec_snap_head or _spec_smoothed_head.distance_to(target_head) > HEAD_TELEPORT_SNAP_DISTANCE:
 		_spec_smoothed_head = target_head
 		_spec_snap_head = false
 	else:
