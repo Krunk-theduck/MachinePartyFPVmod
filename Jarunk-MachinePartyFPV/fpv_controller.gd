@@ -146,8 +146,6 @@ const SMOKE_WALL_GROUP_NAME := "fpv_added_wall"
 const SMOKE_ROOM_CENTER := Vector3(-0.5, 3.8, -0.5)  # from RoomCollision (size 11 x 7.4 x 11)
 const SMOKE_WALL_ZCUT := 4.3    # keep shell triangles past this Z -- the back wall plane (~Z 5)
 const SMOKE_WALL_ZMAX := 6.2    # ...but not the far "void" backdrop behind it
-const SMOKE_PROP_ZMIN := 4.0    # back-wall props to bring along (no-smoking sign, outlet, fire switch, siding)
-const SMOKE_PROP_ZMAX := 6.0
 
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
@@ -236,13 +234,11 @@ var _recipe_done: bool = false                       # gun fully assembled
 var mod_dir: String = ""                             # set by main.gd -- where the mod (and its textures) live
 const RECIPE_ANIM_FPS := 3.0                         # recipe sprite animation speed
 const RECIPE_FRAME_PX := 96                          # downscale target: pixels per animation frame
-const GEAR_SPIN_SPEED := 2.2                         # gear spin rate (rad/sec, +ve = clockwise on screen)
-const GEAR_DRAW_FILL := 1.25                         # gear draw size vs slot (frame has margin for rotation)
 const RED_STROBE_SPEED := 3.2                        # slow strobe of the red light under the pending item
 const GUN_RELOAD_FLASH_PERIOD := 0.5                 # gun sprite stays each of red/regular for this long
 # Each item's sprite SHEET: file + grid (cols x rows), frames read row-major.
 const RECIPE_ITEM_SHEETS := {
-	1: {"file": "gear.png", "cols": 1, "rows": 1},  # single clean frame -- spun clockwise in the draw call
+	1: {"file": "gear.png", "cols": 4, "rows": 4},  # 16 hand-drawn frames, baked to step clockwise
 	2: {"file": "pipe.png", "cols": 2, "rows": 1},
 	3: {"file": "glue.png", "cols": 2, "rows": 1},
 	4: {"file": "strapped.png", "cols": 2, "rows": 2},
@@ -1779,21 +1775,6 @@ func _draw_recipe_sprite(ci: Control, slot: int, item_id: int, r: Rect2, fulfill
 	var cfg: Dictionary = RECIPE_ITEM_SHEETS[item_id]
 	var cols: int = int(cfg["cols"])
 	var rows: int = int(cfg["rows"])
-
-	# Gear: one clean frame spun CLOCKWISE in the draw transform (the source sheet's frames aren't a clean
-	# rotation, so playing them looked like jitter). Parks upright once fulfilled.
-	if item_id == 1:
-		var gtint: Color = Color(0.85, 0.86, 0.9, 0.45) if fulfilled else Color(1.0, 1.0, 1.0, 1.0)
-		var gs: float = minf(r.size.x / float(tex.get_width()), r.size.y / float(tex.get_height())) * GEAR_DRAW_FILL
-		var gdw: float = float(tex.get_width()) * gs
-		var gdh: float = float(tex.get_height()) * gs
-		var gcen: Vector2 = r.get_center()
-		var ang: float = 0.0 if fulfilled else _recipe_anim_time * GEAR_SPIN_SPEED  # +ve = clockwise (Y-down)
-		ci.draw_set_transform(gcen, ang, Vector2.ONE)
-		ci.draw_texture_rect(tex, Rect2(-gdw * 0.5, -gdh * 0.5, gdw, gdh), false, gtint)
-		ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)  # restore for the next slot
-		return true
-
 	var frames: int = maxi(cols * rows, 1)
 	var anim_frame: int = int(_recipe_anim_time * RECIPE_ANIM_FPS) % frames
 
@@ -2364,16 +2345,6 @@ func _update_gun_wall(delta: float) -> void:
 		print("[fpv_mod] gun wall: copied ", kept, " tris (full depth, vert-reflected about x=", cx, ")")
 
 
-func _smoke_prop_ok(nm: String) -> bool:
-	# Only bring flat wall props along -- skip the fan (has its own AnimationPlayer), the timer, the far
-	# void backdrop, and anything light/blood related.
-	var low := nm.to_lower()
-	for bad in ["fan", "timer", "blood", "void", "backdrop", "light"]:
-		if low.contains(bad):
-			return false
-	return true
-
-
 func _update_smoke_wall(_delta: float) -> void:
 	# Smoke Break only: add a third wall on the open side to the player's right by copying the BACK wall's
 	# shell triangles + its props and rotating them 180deg about the room centre onto the open front side.
@@ -2470,19 +2441,11 @@ func _update_smoke_wall(_delta: float) -> void:
 	wall.mesh = combined
 	wall.layers = shell.layers
 	group.add_child(wall)
-	# Bring the back wall's props along ("everything that comes with it").
-	var props_copied := 0
-	for ch in shell.get_children():
-		if ch is MeshInstance3D:
-			var o: Vector3 = (ch as MeshInstance3D).transform.origin
-			if o.z >= SMOKE_PROP_ZMIN and o.z <= SMOKE_PROP_ZMAX and _smoke_prop_ok(String(ch.name)):
-				var dup := (ch as Node3D).duplicate()
-				group.add_child(dup)
-				props_copied += 1
+	# Just the bare wall (no props/signs/timer) -- like the gun-game wall.
 	_smoke_wall_group = group
 	if not _smoke_wall_logged:
 		_smoke_wall_logged = true
-		print("[fpv_mod] smoke wall: built (", kept_tris, " tris, ", props_copied, " props)")
+		print("[fpv_mod] smoke wall: built (", kept_tris, " tris, bare)")
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
