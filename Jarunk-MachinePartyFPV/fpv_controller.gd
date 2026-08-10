@@ -3191,26 +3191,25 @@ func _spec_update_third() -> void:
 
 
 func _spec_update_hunter(t: Node) -> void:
-	# Everything the hunter sees: mirror their camera (renders their arms/gun -- they're world models on
-	# the default render layer), zoom our FOV when they scope, show the scope reticle, and HIDE the laser
-	# (they don't see their own). Aim (yaw/pitch) and laser-on state are network-replicated, so this is
-	# exact on any client. Zoom LEVEL isn't networked, so we infer scoped-or-not from the laser flag.
+	# Make the hunter's OWN camera current -- that's the only way the layer-16 first-person viewmodel
+	# (arms + gun) renders exactly as the hunter sees it; a mirrored camera showed the aim/scope but not
+	# the weapon. We drive THAT camera's fov for the scope zoom and show its reticle, then hide the laser
+	# they don't see. Everything is restored on leave. Aim/laser-state are replicated, so it's exact.
 	_spec_hunter_ref = t
 	var hcam = t.get("camera")
 	if not (hcam is Camera3D) or not is_instance_valid(hcam):
 		return
 	var hc := hcam as Camera3D
 	var scoped := _spec_hunter_scoped(hc)
-	_spec_cam.global_transform = hc.global_transform
-	_spec_cam.fov = 24.0 if scoped else 55.0
-	if not _spec_cam.current:
-		_spec_cam.current = true
-	# Hide the beam the hunter never sees. LaserParent.visible is NOT replicated, so this is local + safe.
-	var lp = hc.get_node_or_null("LaserParent")
+	if _spec_cam != null and is_instance_valid(_spec_cam) and _spec_cam.current:
+		_spec_cam.current = false
+	if not hc.current:
+		hc.current = true
+	hc.fov = 24.0 if scoped else 55.0
+	var lp = hc.get_node_or_null("LaserParent")  # LaserParent.visible is NOT replicated -> local + safe
 	if lp is Node3D:
 		(lp as Node3D).visible = false
-	# The scope reticle the hunter sees when zoomed (its own screen-space overlay, alpha-0 by default).
-	var reticle = t.get_node_or_null("HunterCanvasLayer/Control")
+	var reticle = t.get_node_or_null("HunterCanvasLayer/Control")  # scope overlay, alpha-0 by default
 	if reticle is CanvasItem:
 		(reticle as CanvasItem).modulate.a = 1.0 if scoped else 0.0
 
@@ -3227,14 +3226,15 @@ func _spec_hunter_restore() -> void:
 	if _spec_hunter_ref != null and is_instance_valid(_spec_hunter_ref):
 		var hcam = _spec_hunter_ref.get("camera") if "camera" in _spec_hunter_ref else null
 		if hcam is Camera3D and is_instance_valid(hcam):
+			(hcam as Camera3D).fov = 55.0  # undo the scope zoom on the hunter's own camera
+			if (hcam as Camera3D).current:
+				(hcam as Camera3D).current = false  # hand back; the new mode sets its own camera
 			var lp = (hcam as Camera3D).get_node_or_null("LaserParent")
 			if lp is Node3D:
 				(lp as Node3D).visible = true
 		var reticle = _spec_hunter_ref.get_node_or_null("HunterCanvasLayer/Control")
 		if reticle is CanvasItem:
 			(reticle as CanvasItem).modulate.a = 0.0
-	if _spec_cam != null and is_instance_valid(_spec_cam):
-		_spec_cam.fov = 55.0  # undo any zoom before other modes use our camera
 	_spec_hunter_ref = null
 
 
