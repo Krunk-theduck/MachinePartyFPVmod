@@ -4090,12 +4090,33 @@ func _player_is_active() -> bool:
 	return true
 
 
+func _smoke_is_shot() -> bool:
+	# Smoke break has no is_dead flag. The trolley's shot runs the loser's death animation ("death_window"
+	# /"death_fan") and later hides the body -- both via a call_local routine, so they happen identically
+	# on host and client. Treat either as "shot".
+	if _player == null or not is_instance_valid(_player):
+		return false
+	if _player is Node3D and not (_player as Node3D).visible:
+		return true  # removed after the shot
+	if "anim_handler" in _player:
+		var ah = _player.get("anim_handler")
+		if ah != null and is_instance_valid(ah) and "anim_player" in ah:
+			var ap = ah.get("anim_player")
+			if ap is AnimationPlayer and String((ap as AnimationPlayer).current_animation).begins_with("death"):
+				return true
+	return false
+
+
 func _finished_stay_fpv() -> bool:
 	# True when the local player is inactive but NOT dead -- they finished their task (green pea food,
 	# smoke break, a build, ...) or they're a Recycle survivor between rounds. Those must stay in first
 	# person with look-around, never spectate. Only real death / leaving the game spectates.
 	if _player == null or not is_instance_valid(_player):
 		return false
+	if _is_player_class(&"SmokeBreakPlayer"):
+		# At timer-end EVERY smoke-break player goes inactive while the trolley aims. Keep looking around
+		# until the trolley actually shoots us; only then spectate.
+		return not _smoke_is_shot()
 	if "is_dead" in _player and bool(_player.get("is_dead")):
 		return false
 	if "is_alive" in _player and not bool(_player.get("is_alive")):
