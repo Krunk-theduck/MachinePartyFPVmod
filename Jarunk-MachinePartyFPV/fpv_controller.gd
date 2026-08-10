@@ -137,8 +137,8 @@ const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV cro
 
 # --- Smoke Break: add a 3rd wall on an open side (visual only, hidden when FPV is off). We copy the
 # feature-rich wall behind the player -- the +X wall with its maintenance-hatch DOORS/holes and radiators
-# -- and rotate it 180deg about the room centre so the whole thing (shell + props) lands on the opposite
-# open side (-X), facing inward. A proper rotation keeps normals/winding correct (unlike the gun-wall
+# -- and rotate it +90deg about the room centre so the whole thing (shell + props) lands on the open
+# FRONT (-Z) side, facing inward. A proper rotation keeps normals/winding correct (unlike the gun-wall
 # reflection), so it lights like the real walls. Build-once, then it persists (visibility follows FPV).
 const SMOKE_WALL_ENABLED := true
 const SMOKE_WALL_ART_ROOT := "smoke break near final3"
@@ -2444,7 +2444,7 @@ func _update_smoke_wall(_delta: float) -> void:
 	var group := Node3D.new()
 	group.name = SMOKE_WALL_GROUP_NAME
 	art.add_child(group)
-	var r := Basis(Vector3(0, 1, 0), PI)  # 180deg about Y
+	var r := Basis(Vector3(0, 1, 0), PI * 0.5)  # +90deg about Y: +X wall -> the open FRONT (-Z) side
 	group.transform = Transform3D(r, SMOKE_ROOM_CENTER - r * SMOKE_ROOM_CENTER)
 	var wall := MeshInstance3D.new()
 	wall.name = "wall surface"
