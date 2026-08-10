@@ -221,6 +221,7 @@ var mod_dir: String = ""                             # set by main.gd -- where t
 const RECIPE_ANIM_FPS := 3.0                         # recipe sprite animation speed
 const RECIPE_FRAME_PX := 96                          # downscale target: pixels per animation frame
 const RED_STROBE_SPEED := 3.2                        # slow strobe of the red light under the pending item
+const GUN_RELOAD_FLASH_HZ := 6.5                     # gun sprite red<->regular flash rate while reloading
 # Each item's sprite SHEET: file + grid (cols x rows), frames read row-major.
 const RECIPE_ITEM_SHEETS := {
 	1: {"file": "gear.png", "cols": 4, "rows": 4},
@@ -1658,14 +1659,19 @@ func _draw_gun_bar(ci: Control) -> void:
 	# Thin red outline (gently pulsing).
 	var pulse: float = 0.68 + 0.32 * (0.5 + 0.5 * sin(_recipe_anim_time * RED_STROBE_SPEED))
 	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.85, 0.12, 0.1, pulse), false, 2.0)
-	# Gun sprite: frame 0 = plain (ready), frame 1 = red-lit (reloading). Larger now.
+	# Gun sprite: frame 0 = plain (ready), frame 1 = red-lit. While reloading, flash plain<->red-lit fast
+	# (matching the gun's own red blink); when ready, stay plain.
 	if _recipe_gun_tex != null:
-		var frame: int = 1 if reloading else 0
+		var frame: int = 0
+		if reloading:
+			frame = int(_recipe_anim_time * GUN_RELOAD_FLASH_HZ * 2.0) % 2
 		var fw: float = float(_recipe_gun_tex.get_width()) * 0.5
 		var fh: float = float(_recipe_gun_tex.get_height())
-		var src := Rect2(float(frame) * fw, 0.0, fw, fh)
-		var scale: float = minf((w * 0.96) / fw, (h * 0.66) / fh)
-		var dw: float = fw * scale
+		var ginset: float = 10.0  # trim each frame's edges so the neighbouring frame doesn't bleed in
+		var sw: float = fw - ginset * 2.0
+		var src := Rect2(float(frame) * fw + ginset, 0.0, sw, fh)
+		var scale: float = minf((w * 0.96) / sw, (h * 0.66) / fh)
+		var dw: float = sw * scale
 		var dh: float = fh * scale
 		ci.draw_texture_rect_region(_recipe_gun_tex, Rect2((w - dw) * 0.5, 4.0, dw, dh), src, Color(1, 1, 1, 1))
 	# Status text (red theme): READY light red, RELOADING solid red.
