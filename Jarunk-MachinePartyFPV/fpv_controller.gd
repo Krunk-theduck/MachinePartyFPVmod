@@ -135,6 +135,20 @@ const GUN_WALL_CLOSER := 1.6  # shift the copied wall this much toward the play 
 const GUN_WALL_ENABLED := true
 const GUN_WALL_PROBE := false  # flip true to log the art mesh under the FPV crosshair
 
+# --- Smoke Break: add a 3rd wall on the open side to the player's right (visual only). We lift the BACK
+# wall's triangles + its wall props out of the shell and rotate them 180deg about the room centre so they
+# land on the open FRONT side, facing inward. A proper rotation keeps normals/winding correct (unlike the
+# gun-wall reflection), so the new wall lights exactly like the real ones. Build-once, then it persists.
+const SMOKE_WALL_ENABLED := true
+const SMOKE_WALL_ART_ROOT := "smoke break near final3"
+const SMOKE_WALL_SHELL_MESH := "base mesh"      # the room shell (floor/ceiling/walls baked as one mesh)
+const SMOKE_WALL_GROUP_NAME := "fpv_added_wall"
+const SMOKE_ROOM_CENTER := Vector3(-0.5, 3.8, -0.5)  # from RoomCollision (size 11 x 7.4 x 11)
+const SMOKE_WALL_ZCUT := 4.3    # keep shell triangles past this Z -- the back wall plane (~Z 5)
+const SMOKE_WALL_ZMAX := 6.2    # ...but not the far "void" backdrop behind it
+const SMOKE_PROP_ZMIN := 4.0    # back-wall props to bring along (no-smoking sign, outlet, fire switch, siding)
+const SMOKE_PROP_ZMAX := 6.0
+
 const MANUAL_RELOCK_KEY := KEY_SHIFT
 const YAW_RESEED_DELAY := 0.35  # setup_rpc's seat rotation lands a beat after we first see the skeleton -- correct once, this long after lock-on, then stop (not every rescan, or free-look during countdown gets yanked back to center)
 
@@ -212,6 +226,8 @@ var _smoke_timer_source: Node = null # the minigame's own timer label we mirror 
 var _round_timer_green: bool = false  # true = Forklift (green digits/bezel), false = Smoke Break (red)
 var _gun_wall_clone: Node3D = null  # group node holding our mirrored window-wall clones (empty -X side)
 var _gun_wall_logged: bool = false  # one-shot diagnostic if we can't find a source wall to duplicate
+var _smoke_wall_group: Node3D = null  # our duplicated 3rd wall (back wall rotated onto the open front)
+var _smoke_wall_logged: bool = false
 
 var _recipe_hud: Control                             # Firearm Factory recipe HUD (top-center), custom-drawn
 var _recipe_seq: PackedInt32Array = PackedInt32Array()  # ordered item ids (1..5) of the local recipe
@@ -220,11 +236,13 @@ var _recipe_done: bool = false                       # gun fully assembled
 var mod_dir: String = ""                             # set by main.gd -- where the mod (and its textures) live
 const RECIPE_ANIM_FPS := 3.0                         # recipe sprite animation speed
 const RECIPE_FRAME_PX := 96                          # downscale target: pixels per animation frame
+const GEAR_SPIN_SPEED := 2.2                         # gear spin rate (rad/sec, +ve = clockwise on screen)
+const GEAR_DRAW_FILL := 1.25                         # gear draw size vs slot (frame has margin for rotation)
 const RED_STROBE_SPEED := 3.2                        # slow strobe of the red light under the pending item
 const GUN_RELOAD_FLASH_PERIOD := 0.5                 # gun sprite stays each of red/regular for this long
 # Each item's sprite SHEET: file + grid (cols x rows), frames read row-major.
 const RECIPE_ITEM_SHEETS := {
-	1: {"file": "gear.png", "cols": 4, "rows": 4},
+	1: {"file": "gear.png", "cols": 1, "rows": 1},  # single clean frame -- spun clockwise in the draw call
 	2: {"file": "pipe.png", "cols": 2, "rows": 1},
 	3: {"file": "glue.png", "cols": 2, "rows": 1},
 	4: {"file": "strapped.png", "cols": 2, "rows": 2},
@@ -248,6 +266,7 @@ const SPEC_FREEFLY_LOOK := 0.0035   # free-fly mouse look sensitivity (rad/pixel
 const SPEC_FREEFLY_PAD_LOOK := 2.8  # free-fly controller right-stick look (rad/sec at full tilt)
 const SPEC_PAD_MOVE_DEADZONE := 0.18
 const SPEC_HEAD_SMOOTHING := 20.0   # FPV-spectate head follow rate (tight but de-jittered)
+const SPEC_THIRD_ZOOM := 0.82       # shared-cam 3rd-person: pull in a bit vs the game's wide overview framing
 var _spec_engaged: bool = false     # my spectate system is active (I'm dead + spectating a live round)
 var _spec_mode: int = SPEC_MODE_THIRD  # third-person is the default
 var _spec_cam: Camera3D = null      # my own spectator camera (created on engage, freed on disengage)
@@ -1760,6 +1779,21 @@ func _draw_recipe_sprite(ci: Control, slot: int, item_id: int, r: Rect2, fulfill
 	var cfg: Dictionary = RECIPE_ITEM_SHEETS[item_id]
 	var cols: int = int(cfg["cols"])
 	var rows: int = int(cfg["rows"])
+
+	# Gear: one clean frame spun CLOCKWISE in the draw transform (the source sheet's frames aren't a clean
+	# rotation, so playing them looked like jitter). Parks upright once fulfilled.
+	if item_id == 1:
+		var gtint: Color = Color(0.85, 0.86, 0.9, 0.45) if fulfilled else Color(1.0, 1.0, 1.0, 1.0)
+		var gs: float = minf(r.size.x / float(tex.get_width()), r.size.y / float(tex.get_height())) * GEAR_DRAW_FILL
+		var gdw: float = float(tex.get_width()) * gs
+		var gdh: float = float(tex.get_height()) * gs
+		var gcen: Vector2 = r.get_center()
+		var ang: float = 0.0 if fulfilled else _recipe_anim_time * GEAR_SPIN_SPEED  # +ve = clockwise (Y-down)
+		ci.draw_set_transform(gcen, ang, Vector2.ONE)
+		ci.draw_texture_rect(tex, Rect2(-gdw * 0.5, -gdh * 0.5, gdw, gdh), false, gtint)
+		ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)  # restore for the next slot
+		return true
+
 	var frames: int = maxi(cols * rows, 1)
 	var anim_frame: int = int(_recipe_anim_time * RECIPE_ANIM_FPS) % frames
 
@@ -2199,6 +2233,7 @@ func _render_head_cam(delta: float, active: bool) -> void:
 	# Gun-game wall: OUTSIDE the active gate so it also appears before/during the countdown. It only
 	# runs here on the FPV render path, so it can't show when FPV is toggled off (see _process).
 	_update_gun_wall(delta)
+	_update_smoke_wall(delta)
 
 	_set_fpv_camera_active(true)
 
@@ -2327,6 +2362,127 @@ func _update_gun_wall(delta: float) -> void:
 	if not _gun_wall_logged:
 		_gun_wall_logged = true
 		print("[fpv_mod] gun wall: copied ", kept, " tris (full depth, vert-reflected about x=", cx, ")")
+
+
+func _smoke_prop_ok(nm: String) -> bool:
+	# Only bring flat wall props along -- skip the fan (has its own AnimationPlayer), the timer, the far
+	# void backdrop, and anything light/blood related.
+	var low := nm.to_lower()
+	for bad in ["fan", "timer", "blood", "void", "backdrop", "light"]:
+		if low.contains(bad):
+			return false
+	return true
+
+
+func _update_smoke_wall(_delta: float) -> void:
+	# Smoke Break only: add a third wall on the open side to the player's right by copying the BACK wall's
+	# shell triangles + its props and rotating them 180deg about the room centre onto the open front side.
+	if _player_class_name != &"SmokeBreakPlayer":
+		return
+	if not SMOKE_WALL_ENABLED:
+		return
+	if _smoke_wall_group != null and is_instance_valid(_smoke_wall_group):
+		return
+	var tree := get_tree()
+	if tree == null:
+		return
+	var art := _find_node_named(tree.root, SMOKE_WALL_ART_ROOT, [SCAN_BUDGET])
+	if art == null or not (art is Node3D):
+		return
+	var existing := art.get_node_or_null(NodePath(SMOKE_WALL_GROUP_NAME))
+	if existing is Node3D:
+		_smoke_wall_group = existing as Node3D
+		return
+	var shell := _find_mesh_named(art, SMOKE_WALL_SHELL_MESH, [SCAN_BUDGET])
+	if shell == null or shell.mesh == null:
+		if not _smoke_wall_logged:
+			_smoke_wall_logged = true
+			print("[fpv_mod] smoke wall: shell '", SMOKE_WALL_SHELL_MESH, "' not found yet")
+		return
+	var mesh := shell.mesh as ArrayMesh
+	if mesh == null:
+		return
+	# Build a submesh of just the back wall's vertical faces (Z-facing, past the Z cut), one SurfaceTool
+	# per source surface so each keeps its own lit material. Floor/ceiling slivers are dropped by the
+	# normal test (they face +/-Y, not +/-Z).
+	var combined := ArrayMesh.new()
+	var kept_tris := 0
+	for s in mesh.get_surface_count():
+		var arrays := mesh.surface_get_arrays(s)
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		if verts.is_empty():
+			continue
+		var norms: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL] if arrays[Mesh.ARRAY_NORMAL] != null else PackedVector3Array()
+		var uvs: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV] if arrays[Mesh.ARRAY_TEX_UV] != null else PackedVector2Array()
+		var idx: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] != null else PackedInt32Array()
+		var have_n := norms.size() == verts.size()
+		var have_uv := uvs.size() == verts.size()
+		var indexed := idx.size() > 0
+		var tcount: int = (idx.size() / 3) if indexed else (verts.size() / 3)
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
+		var surf_kept := 0
+		for t in tcount:
+			var i0: int = idx[t * 3] if indexed else t * 3
+			var i1: int = idx[t * 3 + 1] if indexed else t * 3 + 1
+			var i2: int = idx[t * 3 + 2] if indexed else t * 3 + 2
+			var v0: Vector3 = verts[i0]
+			var v1: Vector3 = verts[i1]
+			var v2: Vector3 = verts[i2]
+			var cz := (v0.z + v1.z + v2.z) / 3.0
+			if cz < SMOKE_WALL_ZCUT or cz > SMOKE_WALL_ZMAX:
+				continue
+			var gn := (v1 - v0).cross(v2 - v0)  # geometric normal
+			if gn.length() < 0.000001:
+				continue
+			gn = gn.normalized()
+			if absf(gn.z) < 0.5:  # keep only Z-facing wall faces, not the floor/ceiling
+				continue
+			for ii in [i0, i1, i2]:
+				if have_n:
+					st.set_normal(norms[ii])
+				if have_uv:
+					st.set_uv(uvs[ii])
+				st.add_vertex(verts[ii])
+			surf_kept += 1
+		if surf_kept == 0:
+			continue
+		combined = st.commit(combined)
+		var mat := mesh.surface_get_material(s)
+		if mat != null:
+			combined.surface_set_material(combined.get_surface_count() - 1, mat)
+		kept_tris += surf_kept
+	if kept_tris == 0:
+		if not _smoke_wall_logged:
+			_smoke_wall_logged = true
+			print("[fpv_mod] smoke wall: no back-wall triangles matched")
+		return
+	# One group node carrying the 180deg-about-centre rotation. The wall submesh (base-mesh-local coords)
+	# and the copied props sit under it with their ORIGINAL local transforms, so the group swings them all
+	# onto the open front side together, correctly facing inward.
+	var group := Node3D.new()
+	group.name = SMOKE_WALL_GROUP_NAME
+	art.add_child(group)
+	var r := Basis(Vector3(0, 1, 0), PI)  # 180deg about Y
+	group.transform = Transform3D(r, SMOKE_ROOM_CENTER - r * SMOKE_ROOM_CENTER)
+	var wall := MeshInstance3D.new()
+	wall.name = "wall surface"
+	wall.mesh = combined
+	wall.layers = shell.layers
+	group.add_child(wall)
+	# Bring the back wall's props along ("everything that comes with it").
+	var props_copied := 0
+	for ch in shell.get_children():
+		if ch is MeshInstance3D:
+			var o: Vector3 = (ch as MeshInstance3D).transform.origin
+			if o.z >= SMOKE_PROP_ZMIN and o.z <= SMOKE_PROP_ZMAX and _smoke_prop_ok(String(ch.name)):
+				var dup := (ch as Node3D).duplicate()
+				group.add_child(dup)
+				props_copied += 1
+	_smoke_wall_group = group
+	if not _smoke_wall_logged:
+		_smoke_wall_logged = true
+		print("[fpv_mod] smoke wall: built (", kept_tris, " tris, ", props_copied, " props)")
 
 
 func _collect_meshes(n: Node, out: Array, budget: Array) -> void:
@@ -3200,7 +3356,7 @@ func _spec_update_third() -> void:
 			_spec_cam.current = true
 		var fwd: Vector3 = -base_basis.z
 		var subj: Vector3 = _spec_head_origin(t)
-		_spec_cam.global_transform = Transform3D(base_basis, subj - fwd * _spec_shared_dist)
+		_spec_cam.global_transform = Transform3D(base_basis, subj - fwd * (_spec_shared_dist * SPEC_THIRD_ZOOM))
 		return
 
 	# Nothing to follow -> re-assert the game's own camera.
@@ -4151,6 +4307,8 @@ func _rescan_player() -> void:
 		_smoke_timer_source = null
 		_gun_wall_clone = null
 		_gun_wall_logged = false
+		_smoke_wall_group = null
+		_smoke_wall_logged = false
 		_recipe_seq = PackedInt32Array()
 		_recipe_index = -1
 		_recipe_done = false
