@@ -244,7 +244,7 @@ const RECIPE_ITEM_SHEETS := {
 	2: {"file": "pipe.png", "cols": 2, "rows": 1},
 	3: {"file": "glue.png", "cols": 2, "rows": 1},
 	4: {"file": "strapped.png", "cols": 2, "rows": 2},
-	5: {"file": "spring.png", "cols": 4, "rows": 2, "fps": 6.0},
+	5: {"file": "spring.png", "cols": 4, "rows": 2, "fps": 6.0, "pingpong": true},  # bounce (extend<->compress), no loop cut
 }
 var _recipe_tex: Dictionary = {}                     # item_id -> full-colour sheet (drawn while pending)
 var _recipe_tex_grey: Dictionary = {}                # item_id -> greyscale sheet (drawn once fulfilled)
@@ -1782,7 +1782,15 @@ func _draw_recipe_sprite(ci: Control, _slot: int, item_id: int, r: Rect2, fulfil
 	var frames: int = maxi(cols * rows, 1)
 	var fps: float = float(cfg.get("fps", RECIPE_ANIM_FPS))
 	# A pending item loops; the instant it's fulfilled it parks at its start frame (stops animating).
-	var frame: int = 0 if fulfilled else int(_recipe_anim_time * fps) % frames
+	# Pingpong items (the spring) play 0..N-1..0 so the compress<->extend cycle has no hard loop cut.
+	var frame: int = 0
+	if not fulfilled:
+		if bool(cfg.get("pingpong", false)) and frames > 2:
+			var cyc: int = frames * 2 - 2
+			var p: int = int(_recipe_anim_time * fps) % cyc
+			frame = p if p < frames else cyc - p
+		else:
+			frame = int(_recipe_anim_time * fps) % frames
 
 	var fw: float = float(tex.get_width()) / float(cols)
 	var fh: float = float(tex.get_height()) / float(rows)
