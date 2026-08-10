@@ -50,7 +50,7 @@ const SMOKE_SHAKE_START := 0.35       # drag_progress below this = no shake (a c
 const SMOKE_SHAKE_MAX := 0.085        # world units, peak jitter as drag_progress approaches 1.0
 
 const ONE_LIFE_OVERLAY_COLOR := Color(0.6, 0.0, 0.0)
-const INFECTION_OVERLAY_COLOR := Color(0.18, 0.66, 0.32)  # green twin of the blood vignette (Inside Job)
+const INFECTION_OVERLAY_COLOR := Color(0.14, 0.55, 0.26)  # green twin of the blood vignette (Inside Job)
 const ONE_LIFE_OVERLAY_MIN_ALPHA := 0.30
 const ONE_LIFE_OVERLAY_MAX_ALPHA := 0.55
 const ONE_LIFE_OVERLAY_PULSE_SPEED := 2.6  # radians/sec into the sine driving the pulse
@@ -223,11 +223,11 @@ const RECIPE_FRAME_PX := 96                          # downscale target: pixels 
 const RED_STROBE_SPEED := 3.2                        # slow strobe of the red light under the pending item
 # Each item's sprite SHEET: file + grid (cols x rows), frames read row-major.
 const RECIPE_ITEM_SHEETS := {
-	1: {"file": "gear.png", "cols": 2, "rows": 2},
+	1: {"file": "gear.png", "cols": 4, "rows": 4},
 	2: {"file": "pipe.png", "cols": 2, "rows": 1},
 	3: {"file": "glue.png", "cols": 2, "rows": 1},
 	4: {"file": "strapped.png", "cols": 2, "rows": 2},
-	5: {"file": "spring.png", "cols": 2, "rows": 2},
+	5: {"file": "spring.png", "cols": 4, "rows": 2},
 }
 var _recipe_tex: Dictionary = {}                     # item_id -> full-colour sheet (drawn while pending)
 var _recipe_tex_grey: Dictionary = {}                # item_id -> greyscale sheet (drawn once fulfilled)
@@ -1653,25 +1653,30 @@ func _draw_gun_bar(ci: Control) -> void:
 	var w: float = ci.size.x
 	var h: float = ci.size.y
 	var reloading: bool = _recipe_gun_reloading
-	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.05, 0.045, 0.035, 0.9))
-	var border: Color = Color(0.98, 0.5, 0.15, 0.95) if reloading else Color(0.9, 0.72, 0.28, 0.95)
-	ci.draw_rect(Rect2(0.0, 0.0, w, h), border, false, 2.5)
+	# Black background = same as the gun sprite's own background, so the sprite blends seamlessly.
+	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.0, 0.0, 0.0, 0.94))
+	# Thin red outline (gently pulsing).
+	var pulse: float = 0.68 + 0.32 * (0.5 + 0.5 * sin(_recipe_anim_time * RED_STROBE_SPEED))
+	ci.draw_rect(Rect2(0.0, 0.0, w, h), Color(0.85, 0.12, 0.1, pulse), false, 2.0)
+	# Gun sprite: frame 0 = plain (ready), frame 1 = red-lit (reloading). Larger now.
 	if _recipe_gun_tex != null:
-		var frame: int = 1 if reloading else 0   # frame 0 = plain (ready), frame 1 = red-lit (reloading)
+		var frame: int = 1 if reloading else 0
 		var fw: float = float(_recipe_gun_tex.get_width()) * 0.5
 		var fh: float = float(_recipe_gun_tex.get_height())
 		var src := Rect2(float(frame) * fw, 0.0, fw, fh)
-		var scale: float = minf((w * 0.9) / fw, (h * 0.60) / fh)
+		var scale: float = minf((w * 0.96) / fw, (h * 0.66) / fh)
 		var dw: float = fw * scale
 		var dh: float = fh * scale
-		ci.draw_texture_rect_region(_recipe_gun_tex, Rect2((w - dw) * 0.5, 3.0, dw, dh), src, Color(1, 1, 1, 1))
+		ci.draw_texture_rect_region(_recipe_gun_tex, Rect2((w - dw) * 0.5, 4.0, dw, dh), src, Color(1, 1, 1, 1))
+	# Status text (red theme): READY light red, RELOADING solid red.
 	var label: String = "RELOADING" if reloading else "READY"
-	var col: Color = Color(0.98, 0.55, 0.2) if reloading else Color(0.45, 0.95, 0.5)
+	var col: Color = Color(0.95, 0.24, 0.18) if reloading else Color(1.0, 0.5, 0.42)
 	var font: Font = _spec_font if _spec_font != null else ThemeDB.fallback_font
-	ci.draw_string(font, Vector2(0.0, h - 8.0), label, HORIZONTAL_ALIGNMENT_CENTER, w, 15, col)
+	ci.draw_string(font, Vector2(0.0, h - 7.0), label, HORIZONTAL_ALIGNMENT_CENTER, w, 15, col)
+	# Reload progress bar (red).
 	if reloading:
-		ci.draw_rect(Rect2(8.0, h - 4.0, w - 16.0, 2.0), Color(0.2, 0.2, 0.2, 0.8))
-		ci.draw_rect(Rect2(8.0, h - 4.0, (w - 16.0) * _recipe_gun_reload_frac, 2.0), Color(0.98, 0.6, 0.2, 0.95))
+		ci.draw_rect(Rect2(8.0, h - 4.0, w - 16.0, 2.0), Color(0.25, 0.05, 0.04, 0.9))
+		ci.draw_rect(Rect2(8.0, h - 4.0, (w - 16.0) * _recipe_gun_reload_frac, 2.0), Color(0.95, 0.18, 0.12, 0.98))
 
 
 func _recipe_col(c: Color, solid: bool) -> Color:
@@ -2794,6 +2799,12 @@ func _update_spectate(delta: float) -> bool:
 	# Returns true while genuinely spectating (we drove the camera -> caller returns), false once it's
 	# over (we've already torn down + cleared the release flag -> caller falls through to normal play).
 	if not _spec_engaged:
+		# Don't even engage into a Duck Hunt round that's already ending (is_spectating cleared) -- that
+		# transient is what briefly flashed the buttons at round/game end.
+		var mg0 := _spec_minigame()
+		if mg0 != null and "is_spectating" in mg0 and "spectate_duck_players" in mg0 and not bool(mg0.get("is_spectating")):
+			_spectating_released = false
+			return false
 		_spectate_engage()
 
 	# Camera lost unexpectedly -> rebuild it and keep going. Never tear the whole thing down for this,
@@ -2814,7 +2825,12 @@ func _update_spectate(delta: float) -> bool:
 	# hunter/round). Spectating ends right there.
 	var dh_over: bool = not mg_gone and "is_spectating" in _spec_mg and "spectate_duck_players" in _spec_mg \
 		and not bool(_spec_mg.get("is_spectating"))
-	if mg_gone or alive_again or dh_over:
+	if dh_over:
+		# Clean, deliberate signal -> end immediately (no hysteresis) so nothing flashes.
+		_spectating_released = false
+		_spectate_disengage()
+		return false
+	if mg_gone or alive_again:
 		_spec_end_accum += delta
 		if _spec_end_accum >= 0.3:
 			_spectating_released = false
