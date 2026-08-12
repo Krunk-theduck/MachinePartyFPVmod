@@ -56,6 +56,12 @@ Because it is 100% local and visual:
 
 ---
 
+## Local couch co-op (Machine Party v2)
+
+Machine Party v2 added a local, shared-screen couch mode — up to four players on one screen. Because that is a single shared view, a personal first-person camera does not apply, so **MachinePartyFPV disables itself entirely in local couch co-op.** In local mode every FPV system no-ops: the lobby FPV camera, the in-game first-person camera, the death cam, the whole spectator system (third-person, first-person and free-fly), and the free-cam. Networked (host or join) play is completely unchanged — FPV works exactly as before online.
+
+---
+
 ## First person, everywhere
 
 ### In the lobby
@@ -65,7 +71,7 @@ Because it is 100% local and visual:
   <img src="assets/lobby-fpv-2.png" alt="First person in the lobby looking around the waiting room" width="49%">
 </p>
 
-Turn on **Lobby FPV** and you can stand in the waiting room in first person. **Hold Shift** (keyboard) or the **Left Bumper** (controller) to look around from your character's eyes; let go and the view stays where you left it. It works in both the online lobby and the local couch lobby.
+Turn on **Lobby FPV** and you can stand in the waiting room in first person. **Hold Shift** (keyboard) or the **Left Bumper** (controller) to look around from your character's eyes; let go and the view stays where you left it. It works in the online lobby. **In local couch co-op, FPV — including Lobby FPV — is fully disabled** (see the *Local couch co-op* section below).
 
 ### In the minigames
 

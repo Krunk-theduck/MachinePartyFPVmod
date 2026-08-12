@@ -734,7 +734,9 @@ func _process_lobby_fpv(delta: float) -> bool:
 		return false
 
 	var gm := get_node_or_null("/root/GameManager")
-	if gm == null or bool(gm.get("in_game")):
+	# FPV is fully OFF in local couch co-op (shared-screen, up to 4 local players) — only engage
+	# when actually networked. In local mode the offline peer makes in_game/has_multiplayer_peer true.
+	if gm == null or bool(gm.get("in_game")) or bool(gm.get("local_game")):
 		_restore_lobby_camera()
 		return false
 
@@ -4249,8 +4251,11 @@ func _rescan_player() -> void:
 	var tree := get_tree()
 	var gm := get_node_or_null("/root/GameManager")
 	var in_game: bool = gm != null and bool(gm.get("in_game"))
+	var is_local_couch: bool = gm != null and bool(gm.get("local_game"))
 	_last_scan_in_game = in_game
-	if tree == null or not (multiplayer and multiplayer.has_multiplayer_peer()) or not in_game:
+	# FPV — in-game camera, death cam, the whole spectator system + free-cam — is fully disabled in
+	# local couch co-op. All of it is driven off this rescan lifecycle, so gating here turns it all off.
+	if tree == null or not (multiplayer and multiplayer.has_multiplayer_peer()) or not in_game or is_local_couch:
 		if _player != null or _dying:
 			_end_death_cam()
 			_restore_head()
